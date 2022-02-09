@@ -1,0 +1,196 @@
+#!/usr/bin/perl
+
+use Getopt::Long;
+
+use strict;
+
+# New features
+# convert 2- or 4-field records to 8-field, by inventing GUIDs and portnumbers
+# check for duplicate or otherwise invalid records
+
+sub usage {
+        print "Usage: orientLinks [--alphasort] [--reverse] [--select=f1[,f2...]] [file]\n";
+        print "Example:\n";
+	print "    cat map.csv | orientLinks | sort > l1\n";
+	print "    iba_extract_sel_links | orientLinks --select=4,2 | sort > l2\n";
+	print "    sdiff l1 l2\n";
+        exit 1;
+}
+
+#              iba_extract_sel_links | orientLinks --select=4,2
+# iba_extract_link | cut -d \; -f 7- | orientLinks
+
+
+# sort = logical|alpha, reverse = 0|1
+# select on input, select on output, examples: iba_extract_link needs trimming, but cut can do that
+# select on input is really 'specify sort fields', select fields to output.
+# but non sort fields may have to be restored before output
+
+
+
+my $optAlphaSort = 0;
+my $help = 0;
+my $optSelect = '';
+my $optReverse = 0;
+
+my $dummyGUID = 0x000abc0000000001;
+my %dummyGUIDs;		# $dummyGUIDs{switchName} = switchGUID
+my %portNumbers;	# $portNumbers{switchGUID}{portNumber} = 1 if used
+my %portNumberDummy;	# $portNumberDummy{switchGUID} = N, for generating portnumbers
+
+GetOptions(
+        'alphasort' => \$optAlphaSort,
+        'reverse' => \$optReverse,
+	'select=s'    => \$optSelect,
+        'help'  => \&help
+) or usage();
+
+usage() if $help;
+
+if( 0 && $optSelect && ((split ',', $optSelect) % 2) ) {
+	die "Number of fields in select option is not an even number";
+}
+
+
+my $comment = qq@
+
+This script takes a report of link records and orients them in a consistant way to enable
+them to be sorted and compared to other reports. For example, to compare a cable map from
+Excel with a fabric report from iba_extract_sel_links.
+It also has an option to select which fields you want to output.
+Select is provide because cut -d \; -f 4,2,8,6 does not preserve the order
+of fields in the -f option.
+
+Link reports are files containing one link per line, each line has semi-colon separated fields.
+(e.g. Like iba_extract_link)
+This script has no knowledge of the particular field layout, it simply breaks the line in half
+to get the two nodes. Then t scans the node text to recognize Spines, Leafs, etc; or does
+a simple alpha sort.
+
+FYI - Record format conversions:
+        How to convert from various formats to a 'Simple' name;port;name;port
+        from iba_extract_links          cut -d \; -f 7-
+        from iba_extract_sel_links      awk -F \; '{printf "%s;%s;%s;%s\n", $4, $2, $8, $6}'
+
+FYI - How to ignore portnumbers
+        remove portnumbers from iba_extract_sel_links: cut -n -d \; -f 2,5
+        overwrite portnumbers from 'Simple':   awk -F \; '{printf "%s;XX;%s;XX\n", $1, $3}'
+
+@;
+
+
+sub nodeRole {
+	# This returns a 'seniority number'
+	# Spine = 8, Leaf = 7, Edge = 5, HCA = 1
+
+	my $a = shift;
+	my $t;
+	if( $a =~ /\bCA\b/ ) {			# HCA
+		$t = 1;
+	} elsif( $a =~ /\bFI\b/ ) {			# HCA
+		$t = 1;
+	} elsif( $a =~ /[ _]S[12]\d\d[AB]\b/ ) {	# Spine (Underscore used on some sites)
+		$t = 8;
+	} elsif( $a =~ /[ _]L[12]\d\d[AB]*\b/ ) {	# Leaf
+		$t = 7;
+	} elsif( $a =~ /core/i ) {
+		$t = 9;
+	} elsif( $a =~ /edge/i ) {
+		$t = 4;
+	} elsif( $a =~ /\bHCA-[\d]\b/ ) {	# HCA
+		$t = 2;
+	} else {				# Anything else, like an unanamed switch
+		$t = 3;
+	}
+	# print "xxxxxxxxxxxxxxxxxxxxxxxxx $t $a\n";
+	return $t;
+}
+
+while (<>) {
+	chomp;
+	tr /\r//d;	# in case this is DOS format
+	my $nFields = split ';';
+	if( $nFields % 2 ) {
+		die "Number of fields in input record is not an even number";
+	}
+
+	if($nFields == 4) {
+		my($name1, $port1, $name2, $port2) = split ';';
+		if(!exists($dummyGUIDs{$name1})) {
+			$dummyGUIDs{$name1} = sprintf('0x%016x', $dummyGUID++);
+		}
+		if(!exists($dummyGUIDs{$name2})) {
+			$dummyGUIDs{$name2} = sprintf('0x%016x', $dummyGUID++);
+		}
+		# Needs test to determine SW/CA
+		$_ = "$dummyGUIDs{$name1};$port1;SW;$name1;$dummyGUIDs{$name2};$port2;SW;$name2";
+		$nFields = 8;
+	}
+		
+		
+=cut
+	if( 0 && $optSelect ) {
+		@fList = split ',', $optSelect;
+		foreach $i (0..$#fList) { $fList[$i]--; }
+	} else {
+		@fList = (0..$nFields-1);
+	}
+	$f1 = $f2 = '';
+	foreach $i (@fList) {
+		if($i < ($nFields/2)) {
+			$f1 .= $_[$i]. ';';
+		} else {
+			$f2 .= $_[$i]. ';';
+		}
+	}
+=cut
+	# cut record into two halfs
+	my $s = $nFields/2;
+	m/^((.*?;){$s})(.*)$/;
+		#  (.*?;) is a string ending in the first ;
+		# ((.*?;){4}) is 4 of those
+	my $f1 = $1;
+	my $f2 = $3;
+
+	$f1 =~ s/;$//;
+	$f2 =~ s/;$//;
+
+	# $f1 = nodeRole($f1);
+	# $f2 = nodeRole($f2);
+	# print "A $f1\n";
+	# print "B $f2\n";
+
+	my $fSwap;
+	if( $optAlphaSort || (nodeRole($f1) == nodeRole($f2)) ) {
+		# either, we have forced 'alphasort' (not using nodeRole()),
+		# or nodeRole() cannot see any difference, eg a Leaf to Leaf link.
+		# So, use a simple aplha sort to maintain consistancy
+		# Not clever, but it is consistant without needing to understand the content.
+		$fSwap = 1 if $f1 < $f2;
+	} elsif( nodeRole($f1) < nodeRole($f2) ) {
+		$fSwap = 1;
+	} else {
+		$fSwap = 0;
+	}
+
+	$fSwap = (!$fSwap) if $optReverse;
+
+	if($optSelect) {
+		my @f1a = split ';', $f1; $f1 = '';
+		my @f2a = split ';', $f2; $f2 = '';
+		foreach my $i (split ',', $optSelect) {
+			$f1 .= $f1a[$i-1]. ';';
+			$f2 .= $f2a[$i-1]. ';';
+		}
+		$f1 =~ s/;$//;
+		$f2 =~ s/;$//;
+	}
+			
+	if($fSwap) {
+		print "$f2;$f1\n";
+	} else {
+		print "$f1;$f2\n";
+	}
+}
+
+exit 0;

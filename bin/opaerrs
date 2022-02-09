@@ -1,0 +1,1450 @@
+#!/usr/bin/perl
+
+my $helpText = qq#
+Usage:
+	opaerrs [--ibaReport|ibaSelLinks|ibDiag[=inFile]]
+		[--clr]
+		[--SWsOnly|--noFIs]
+		[--errorMask=all|min|<hex>|none]
+		[--thresholdFile=<thresholdfile>|--c=<thresholdfile>]
+		[--snap] [--delta]
+		[--topologyFile=<topologyFile>|--T=<topologyFile>]
+
+	By default, opaerrs will run opareport and reformat the results.
+	--ibaReport|ibaSelLinks|ibDiag: use opareport or opaextract_sel_links or ibqueryerrors+iblinkinfo.
+		[=inFile]: take data from this file instead of running the command.
+		ibaSelLinks only reports topology.
+
+	--clr: Clears the counters and makes a timestamp.
+
+	--SWsOnly: Speeds up fabric scan.
+		Do not query counters on FIs. However, print counters from the switch end of FI links.
+	--noFIs: Speeds up fabric scan and reduces length of report.
+		Do not query or print counters on FIs.
+        --noPortState: Speeds up fabric scan. Do not collect PortState and CableInfo.
+        --noCableSerial: Reduces report width. Do not list the Cable Serial Number.
+
+	Error mask:	null|null|null|Slow   Symb|Lrec|Ldwn|PrtR   RmtE|RlyE|TxDc|Xcnt   Rcnt|Lint|ExBf|VL15
+	Default: 0x1f26, Min: 0x1d20, All: 0x1fff.
+
+	--snap: Take a snapshot of error counters, for later use by --delta.
+	--delta: Show the difference in error counters between current and snapshot.
+                Note: "links with other error types" may over-report.
+
+
+Examples:
+	opaerrs
+	opaerrs -T topoISLs.txt
+	opareport -o errors -c my_thresholds | opaerrs --ibaReport -
+	iba_extract_sel_links | opaerrs --ibaSelLinks -
+	opaerrs -ibDiag
+	(ibqueryerrors -C qib0; iblinkinfo -C qib0 --line) | opaerrs -ibDiag - -T topoISLs.txt
+	ibqueryerrors -C qib0 -r | opaerrs -ibDiag -
+
+#;
+
+$comment = qq#
+
+Possible things to do:
+    topology file operations:
+	fabric stats
+	missing/unexpected switches
+	list missing/unexpected links, ignore port numbers, ISL only
+	list missing/unexpected links, include port numbers
+	list missing ports, including their state
+
+    Think about a topo file with FIs in it
+
+	Delta values
+		what if v1 is less than v0? (currently shows -ve)
+		numbered snaps?
+		maybe snapshot file should be in current directory (better behaviour with multiple users)
+		snapshot timestamp
+
+ToDo:
+
+	These could all be done in one place:
+		$nodesDB{$guid}{type} = 'SW' if $port > 2;
+		$nodeGUID{$4} = $g1;
+	ibqueryerrors: report errors on single ports (no links)
+
+	pass iba_report arguments?
+	better shorten NodeDesc
+	handle bad topology file
+
+	Compare to topology
+
+	csv output
+	2 lines per link, ie don't combine port values
+	consolidate classify tests
+
+	maybe env var for:
+		topology file?
+		default command line?
+
+#;
+
+use strict;
+use Data::Dumper;
+
+
+# Conventions:
+# $g1, $n1, $d1 = GUID, PortNum, NodeDesc
+# $p1 = "$g1;$n1", that is a Port. $n1 should be %02d to ensure proper sorting and matching.
+
+#### Global variables
+# constants
+my $timeStampFile = '/tmp/opaerrs_cleartimestamp';
+my $thresholdFile = '/tmp/opaerrs_thresholds';
+my $deltaDataFile = '/tmp/opaerrs_data';
+
+my @errorList;
+my %shortErrorNames;
+my %errorBit;
+my $errorsSelectedMask;
+my $linkQualityIndicatorThreshold = 5;	# We need this because a non-entry from opareport -o errors mean the value=threshold.
+					# We try to read it from the input data, but this default value is here for safety.
+
+# raw input data
+my @inputData;
+
+# extracted from input data
+my %nodesDB;		# $nodesDB{$guid}{NodeDesc,NodeType,Exists} = value
+my %portsDB;		# $portsDB{"$guid;$portnum"}{errors,linkState,SymbolErrors,etc} = value
+my %linksDB;		# $topoLinksDB{"$guid;$portnum"} = "$guid;$portnum"
+my %nodeGUID;		# NodeGUID = $nodeGUID{$NodeDesc}
+
+my @smServers;		# guid;state
+
+my %topoNodesDB;
+my %topoPortsDB;
+my %topoLinksDB;
+my @topoLinks;		# push @topoLinks, "$p1;$p2", probably for old way of doing things
+
+my @reportPortsList;  # Contains one 'senior' port per link, plus individual ports that are non-Active && non-Offline; sorted.
+
+my @fabLinks;		# class;guid1;port1;guid2;port2 XXXX currently used by readIBdiag and readSelLinks (which are not used)
+
+my $hasLinks;
+my $hasErrorReport;
+my $hasPortStates;
+
+my $tNow;
+
+
+################################################################################################
+################################################################################################
+################################################################################################
+
+
+use Getopt::Long;
+
+my $iba_args = '';
+my $ibDiag_args = '-C qib0 ';
+
+# Set $hca from $PORTS
+my $hca = '';
+if( $ENV{'PORTS'} ) {
+        my $p = $ENV{'PORTS'};
+        $p =~ s/([0-9]):[0-9]/$1/;
+        $hca = "-h $p ";
+}
+
+
+# Command line options
+my $optHelp;
+my $optClr;
+my $optThresholds;
+my $optNoFIs;
+my $optNoPortState;
+my $optNoCableSerial;
+my $optSWsOnly;
+my $optTopology;
+my $optErrorMask	= 'no';
+my $optSnap;
+my $optDelta;
+
+my $optIbaReport	= 'no';
+my $optIbaSelLinks	= 'no';
+my $optIbDiag		= 'no';
+my $optVerify		= 'no';
+
+my $inputType = 'ibaReport';
+my $inputFile = '';
+
+for(my $i=0; $i < scalar(@ARGV); $i++) {
+	$ARGV[$i] = '-clr' if $ARGV[$i] eq 'clr';	# Backward compatibility
+}
+
+GetOptions(
+	'help'			=>\$optHelp,
+	'clr'			=>\$optClr,
+	'noFIs'			=>\$optNoFIs,
+	'SWsOnly'		=>\$optSWsOnly,
+	'noPortState'		=>\$optNoPortState,
+	'noCableSerial',	=>\$optNoCableSerial,
+	'thresholdFile|c=s'	=>\$optThresholds,
+	'topologyFile|T=s'	=>\$optTopology,
+	'snap'			=>\$optSnap,
+	'delta'			=>\$optDelta,
+
+	'errorMask:s'		=>\$optErrorMask,
+	'ibaReport:s'		=>\$optIbaReport,
+	'ibaSelLinks:s'		=>\$optIbaSelLinks,
+	'ibDiag:s'		=>\$optIbDiag,
+	'verify:s'		=>\$optVerify,
+	);
+
+if(@ARGV) {
+	my $o = "Unknown options: ";
+	foreach my $opt (@ARGV) { $o .= $opt. ' '; }
+	print "$o\n";
+	$optHelp=1;
+}
+if($optHelp) {
+	print $helpText;
+	exit 0;
+}
+# if("$optIbaReport $optIbaSelLinks $optIbDiag " eq 'no no no ') {
+# 	$optIbaReport = '';	# This sets the default
+# }
+if($optIbaReport ne 'no') {
+	$inputType = 'ibaReport';
+	$inputFile = $optIbaReport;
+} elsif($optIbaSelLinks ne 'no') {
+	$inputType = 'ibaSelLinks';
+	$inputFile = $optIbaSelLinks;
+} elsif($optIbDiag ne 'no') {
+	$inputType = 'ibDiag';
+	$inputFile = $optIbDiag;
+}
+
+if($optThresholds && !(-f $optThresholds)) {
+	print "Threshold file '$optThresholds' not found.\n";
+	exit 1;
+}
+if($optTopology && !(-f $optTopology)) {
+	print "Topology file '$optTopology' not found.\n";
+	exit 1;
+}
+if(($optVerify ne 'no') && !$optTopology) {
+	print "Option '--verify' requires topology file.\n";
+	exit 1;
+}
+if($optNoFIs || $optSWsOnly) {
+	$iba_args .= '-F nodetype:SW -L ';
+}
+
+
+if($optVerify ne 'no' && $optErrorMask eq 'no') {
+	$errorsSelectedMask = 0;
+} elsif($optErrorMask eq 'no' || $optErrorMask eq '') {
+	# $errorsSelectedMask = 0x1f26;		# Default, True Scale
+	# $errorsSelectedMask = 0x1ff8;		# Default, OPA, first rev
+	$errorsSelectedMask = 0x1e30;		# Default, OPA, May 2016
+} elsif($optErrorMask =~ /all/i) {
+	$errorsSelectedMask = 0x1fff;
+} elsif($optErrorMask =~ /min/i) {
+	$errorsSelectedMask = 0x1d20;
+} else {
+	$errorsSelectedMask = $optErrorMask =~ /^0[x\d]/ ? oct($optErrorMask) : ($optErrorMask+0);
+}
+
+# printf("optVerify=$optVerify, optErrorMask=$optErrorMask, errorsSelectedMask=0x%04x\n", $errorsSelectedMask);
+	
+$optVerify = 's' if !$optVerify;		# Default
+
+
+################################################################################################
+################################################################################################
+################################################################################################
+
+
+
+# Create a default threshold file
+if(!$optThresholds) {
+	open FF, ">$thresholdFile" || die;
+if(0) {
+	print FF qq|
+Threshold                      Equal
+PortXmitData                   0
+PortRcvData                    0
+PortXmitPkts                   0
+PortRcvPkts                    0
+SymbolErrorCounter             1
+LinkErrorRecoveryCounter       1
+LinkDownedCounter              1
+PortRcvErrors                  1
+PortRcvRemotePhysicalErrors    1
+PortRcvSwitchRelayErrors       1
+PortXmitDiscards               1
+PortXmitConstraintErrors       1
+PortRcvConstraintErrors        1
+LocalLinkIntegrityErrors       1
+ExcessiveBufferOverrunErrors   1
+VL15Dropped                    1
+|;
+} else {
+	print FF qq|
+Threshold                        Equal
+LinkQualityIndicator             5
+UncorrectableErrors              1
+LinkDowned                       1
+RcvErrors                        1
+ExcessiveBufferOverruns          1
+FMConfigErrors                   1
+LinkErrorRecovery                1
+LocalLinkIntegrityErrors         1
+RcvRemotePhysicalErrors          0
+# Security
+XmitConstraintErrors             1
+RcvConstraintErrors              1
+# Routing or Down nodes still being sent to
+RcvSwitchRelayErrors             1
+XmitDiscards                     1  # superset of CongDiscards
+# Congestion
+CongDiscards                     1
+RcvFECN                          0
+RcvBECN                          0
+MarkFECN                         0
+XmitTimeCong                     0
+XmitWait                         0
+# Bubbles
+XmitWastedBW                     0
+XmitWaitData                     0
+RcvBubble                        0
+|;
+}
+
+	$iba_args .= "-c $thresholdFile ";
+} else {
+	$iba_args .= "-c $optThresholds ";
+}
+
+#################################################################################################################
+#################################################################################################################
+#################################################################################################################
+# Data parsing subroutines
+
+
+#### Read data from @inputData and populate %nodesDB, %portsDB and %linksDB
+# Data is from iba_report with various -o types
+sub readIbaReport {
+
+    my($g1, $g2, $p1, $p2, $nodes_NodeGUID);
+    my $links = 1; # I will capture all links, whatever report they appear in, and then de-dup them.
+
+    foreach (@inputData) {
+	if(/^Link Summary/) {
+		# iba_report -o links
+		# $links = 1;
+		$hasLinks = 1;
+	} elsif($links && /^--------/) {
+		# $links = 0;
+	} elsif(/Links Checked.+Errors found/) {
+		$hasErrorReport = 1;
+	} elsif(/(\w+)\s+(\d+)\s+(SW|FI)\s+(.+)$/) {
+ 		#  40g 2048 0x00066a00e300566d   7 SW VCcore02_L203
+		# <->       0x00066a00e3006128  18 SW VCgrp03edge24
+		$g1 = $1; $p1 = sprintf('%02d', $2);
+		$nodesDB{$g1}{NodeType} = $3;
+		$nodesDB{$g1}{NodeDesc} = $4;
+		$portsDB{"$g1;$p1"}{Exists} = 1;
+		$portsDB{"$g1;$p1"}{PortState} = 'Active';
+		$nodeGUID{$4} = $g1;
+		if($links && /^<->/) {
+			$linksDB{"$g1;$p1"} = "$g2;$p2";
+			$linksDB{"$g2;$p2"} = "$g1;$p1";
+		} elsif($links) {
+			$g2 = $g1; $p2 = $p1;
+		}
+	# } elsif(/\s+(\w+(Error|Downed|Discard|Drop)\w*):\s+(\d+)/) {
+	} elsif(/\s+(\w+):\s+(\d+) (Exceeds|Below) Threshold/) {
+		# iba_report -o errors
+		#     SymbolErrorCounter: 592 Exceeds Threshold: 1
+		$portsDB{"$g1;$p1"}{Errors} |= $errorBit{$1};
+		$portsDB{"$g1;$p1"}{$1} = $2;
+	} elsif(/\s+LinkQualityIndicator\s+(\d+)\b/) {
+		#     LinkQualityIndicator           5
+		# We need this threshold
+		$linkQualityIndicatorThreshold = $1;
+	} elsif(/\s+(\d+)x\s+([0-9\.]+)Gb/) {
+		# iba_report -o slowlinks
+      		#        1x   5.0Gb   1-4x     2.5-10Gb
+		$portsDB{"$g1;$p1"}{Errors} |= $errorBit{'Slow'};
+		$portsDB{"$g1;$p1"}{Slow} = $1. 'x'. ($2 + 0);
+	
+# Rate NodeGUID          Port Type Name
+#      Active                            Enabled
+#      Lanes, Used(Tx), Used(Rx), Rate,  Lanes,   DownTo,  Rates
+# 100g 0x00117500ff536c5f   5 SW   OmniPth00117501ff536c5f
+#      4      4         3         25Gb   4        3,4      25Gb
+# <->  0x0011750101574e65   1 FI   bw-1-01 hfi1_0
+#      4      3         4         25Gb   4        3,4      25Gb
+
+	} elsif(/\s+(\d)\s+(\d)\s+(\d)\s+.+Gb.+Gb/) {
+		# opareport -o slowlinks
+      		#        xxxxxxxxxxxxxxx
+		$portsDB{"$g1;$p1"}{Errors} |= $errorBit{'Slow'};
+		$portsDB{"$g1;$p1"}{Slow} = '   '. $2. 'x'. $3. 'x  ';
+
+
+	} elsif(/^\s+NodeGUID: (\w+) /) {
+		# iba_report -o nodes
+		# NodeGUID: 0x00066a00e300624d Type: SW
+		$nodes_NodeGUID = $1;
+	} elsif(/^\s+LID: (\w+)/) {
+		# iba_report -o nodes
+		# LID: 0x0589 LinearFDBCap: 25088 LinearFDBTop:  4402 MCFDBCap:  1024 MCFDBTop: xxxxx
+		$nodesDB{$nodes_NodeGUID}{lid} = $1;
+	} elsif(/^\s+State: (Master|Standby|Inactive)\s+Name: (.+)$/) {
+		# iba_report -o nodes, SM lines
+		# State: Master      Name: master1 HCA-3
+		push @smServers, "$2;$1";
+
+	} elsif(/^(Master|Standby|inactive)\s+(\w+)\s+(.+)$/) {
+		# iba_report -o brcomps, SM lines
+		push @smServers, "$2;$1";
+	}
+    }
+}
+
+
+
+
+
+
+
+
+
+sub readIBdiag {
+
+# ibqueryerrors -C qib0 --report-port | ./this-code
+# (ibqueryerrors -C qib0; iblinkinfo -C qib0 --line) |./this-code
+# infiniband-diag
+
+	# $hasLinks = 1 if scalar(grep /^0x\w+.*==>\s+0x\w+ /, @inputData) > 10;	# Could use this
+
+ my ($ibqDesc, $ibqType, $ibqGUID);	# Carries between sequential ibqueryerrors records
+
+ foreach (@inputData) {
+  my($guid1, $desc1, $lid1, $portnum1, $guid2, $desc2, $lid2, $portnum2);
+
+
+  if(/^Errors for (\w*) *"(.*)"/) {
+	# ibqueryerrors record
+	# Errors for "n05-029 qib1"
+	# or Errors for 0x66a00e30061fd "VCcore04_L208"
+	$ibqType = $1 ? 'SW' : '';	# Carry over to next line
+	$ibqDesc = $2;	# Carry over to next line
+
+  } elsif(/^\s+GUID\s+(\w+)\s+port\s+(\d+):/) {
+	# ibqueryerrors record
+        # GUID 0x66a00e3006114 port 16: [PortRcvRemotePhysicalErrors == 68] [VL15Dropped == 19]
+	$hasErrorReport = 1;
+	next if $2 =~ /ALL/;
+        my $guid1 = sprintf('0x%016x', hex($1));
+        my $portnum1 = sprintf('%02d', $2);
+	my $port = "$guid1;$portnum1";
+
+	# This should get done by the linkinfo record handler
+	# $nodesDB{$guid1}{NodeType} = $ibqType;
+	# $nodesDB{$guid1}{NodeType} = 'SW' if $portnum1 > 2;	# Unecessary if we trust $ibqType
+	# $nodesDB{$guid1}{NodeDesc} = $ibqDesc if !exists $nodesDB{$guid1}{NodeDesc};
+	# $portsDB{$port}{Exists} = 1;
+
+	$ibqGUID = $guid1;
+
+        while ( s/\[(\w+)\s+==\s+(\d+)\]// ) {
+            # this loop catches each [Error == 99]
+            # if it matches, it snips it out and looks for another
+            $portsDB{$port}{$1} = $2;
+	    $portsDB{$port}{Errors} |= $errorBit{$1};
+        }
+  } elsif(/Link info: (.*)$/) {
+	# ibqueryerrors record
+	# Link info:   1879   1[  ] ==( 4X          10.0 Gbps Active/  LinkUp)==>  0x00066a00e30060d2   3555    1[  ] "VCgrp02edge09" ( )
+	# Link info:    365  19[  ] ==(                Down/ Polling)==>             [  ] "" ( )
+	$_ = qq|$ibqGUID "$ibqDesc" $1 ibqueryerrors|;	# Make an iblinkinfo record, and pass to the next block of code.
+  }
+
+
+  if(/^0x.+==>.+/) {
+	# iblinkinfo record
+        my($port1, $linkState, $port2, $linkComment, $errsFlg) = m/^(.*)==\((.*)\)==>\s+(.*)\s+\((.*)\)\s*(.*)/;
+	$hasLinks = 1 unless $errsFlg;		# if this has been passed from ibqueryerrors, then we don't have a full set of links
+	# print "xxxx   $port1 && $port2\n";
+        $guid1 = $desc1 = $lid1 = $portnum1 = '';
+        $port1 =~ m/^0x(\w+) " *(.*?)"\s+(\d+)\s+(\d+)\[..\]/;
+        $guid1=sprintf('0x%016x', hex($1)); $desc1=$2; $lid1=$3; $portnum1=sprintf('%02d', $4);
+	$nodesDB{$guid1}{NodeDesc} = $desc1;
+	$nodesDB{$guid1}{lid} = $lid1;
+	$nodesDB{$guid1}{NodeType} = 'SW' if $portnum1 > 2;
+	$portsDB{"$guid1;$portnum1"}{state} = $linkState;
+	$portsDB{"$guid1;$portnum1"}{Exists} = 1;
+	$nodeGUID{$desc1} = $guid1;
+
+	$guid2 = $desc2 = $lid2 = $portnum2 = '';
+	if($linkState =~ /LinkUp/i) {
+        	$port2 =~ m/^0x(\w+)\s+(\d+)\s+(\d+)\[..\] " *(.*?)"/;
+        	$guid2=sprintf('0x%016x', hex($1)); $lid2=$2; $portnum2=sprintf('%02d', $3); $desc2=$4;
+		$nodesDB{$guid2}{NodeDesc} = $desc2;
+		$nodesDB{$guid2}{lid} = $lid2;
+		$nodesDB{$guid2}{NodeType} = 'SW' if $portnum2 > 2;
+		$portsDB{"$guid2;$portnum2"}{state} = $linkState;
+		$portsDB{"$guid2;$portnum2"}{Exists} = 1;
+		$nodeGUID{$desc2} = $guid2;
+
+		if($linkComment =~ /Could/i) {
+			$portsDB{"$guid1;$portnum1"}{Errors} |= $errorBit{'Slow'};
+			$portsDB{"$guid2;$portnum2"}{Errors} |= $errorBit{'Slow'};
+		}
+
+		push @fabLinks, "class;$guid1;$portnum1;$guid2;$portnum2";
+		
+	} else {
+		push @fabLinks, "class;$guid1;$portnum1;0xDummy;00";
+	}
+        # print "$guid1;$portnum1;SW;$desc1;$guid2;$portnum2;SW;$desc2\n";
+  }
+
+ }
+
+
+    # De-dup, check for either orientation
+    my %linksDeDup;
+    foreach (@fabLinks) {
+	my($c, $g1, $p1, $g2, $p2) = split ';', $_;
+	if( !exists $linksDeDup{"$c;$g1;$p1;$g2;$p2"} && !exists $linksDeDup{"$c;$g2;$p2;$g1;$p1"} ) {
+		$linksDeDup{"$c;$g1;$p1;$g2;$p2"} = 1;
+	}
+    }
+    @fabLinks = keys %linksDeDup;
+	
+    # Fixup SW/FI
+    foreach my $guid (keys %nodesDB) {
+	next if $nodesDB{$guid}{NodeType};
+	if($guid =~ /0x00066a/) {
+ 		$nodesDB{$guid}{NodeType} = 'SW';	# A bit sloppy, but needed if iblinkinfo is not provided
+	} else {
+ 		$nodesDB{$guid}{NodeType} = 'FI';
+	}
+    }
+
+    # Fixup 'Slow' field, with phys-state if down, or width x speed if up and slow.
+	my %stateNames = qw(
+		Poll	Pol
+		Slee	Slp
+		Port	Train
+		Disa	Disbl
+	);
+	# Make Training and Disabled text longer, so that it is more noticable on the report
+    foreach my $port (keys %portsDB) {
+	# ( 4X          10.0 Gbps Active/  LinkUp)
+	my($width, $speed, $units, $logical, $phys) = ($portsDB{$port}{state} =~ m#^ *(\w*) +(\S*) +(\w*) +(\w+)/ *(\w+)$#);
+	# $portsDB{$port}{state} = "$width-$speed-$units-$logical/$phys";
+	if($portsDB{$port}{Errors} & $errorBit{Slow}) {
+		$portsDB{$port}{Slow} = lc($width). ($speed + 0);
+	}
+	if($phys !~ /LinkUp/i) {
+		my $s2 = $stateNames{substr($phys, 0, 4)};
+		$phys = $s2 if $s2;
+		$portsDB{$port}{Slow} = $phys;
+	}
+    }
+
+}
+
+sub portDesc {
+	my $p1 = shift;
+	my($g1, $n1) = split ';', $p1;
+	return sprintf('%s;%02d', $nodesDB{$g1}{NodeDesc}, $n1);
+}
+
+sub getAllPortData {
+
+	warn "Getting state info for all switch ports...\n";
+	my $cmd = "opareport $hca $iba_args -Qq -o comps -d 5 -A -F nodetype:SW -x | grep -v '<VL' |";
+	$cmd="opareport.02.errs" if -e "opaerrs_testmode";;
+
+	my %cables;
+	my %requiredAttributes;
+	foreach my $attrib (qw(PortState PortType PhysState LinkWidthDnGradeTxActive LinkWidthDnGradeRxActive LinkSpeedActive )) {
+		$requiredAttributes{$attrib} = 1;
+	}
+
+	open my $ff, $cmd || die;
+	# Step #1: Parse the xml, and populate %portsDB{}
+	my $path = '';
+	foreach my $line (<$ff>) {
+		next if $line =~ m|<VL|;	# Speeds up approx x2
+		next if $line =~ m|^<\?|;
+		next if $line =~ m|^<Report|;
+		chomp $line;
+		if($line =~ m|<(\w+.*?)>|) { $path .= '/'. $1; } # build path
+
+		# Look for items I need
+		if($line =~ />(.*)</) {
+			my $value = $1;
+			# xxx/PortInfo id="0x00117501026775a1:48"/CableInfo/VendorName
+			if($path =~ m|PortInfo id="(\w+):(\d+)"/CableInfo/(\w+)| ) {
+				my $g = $1;
+				my $n = sprintf('%02d', $2);
+				my $attrib = $3;
+				$portsDB{"$g;$n"}{CableInfo}{$attrib} = $value;
+			} elsif($path =~ m|PortInfo id="(\w+):(\d+)"/(\w+)| ) {
+				my $g = $1;
+				my $n = sprintf('%02d', $2);
+				my $attrib = $3;
+				$portsDB{"$g;$n"}{$attrib} = $value if $requiredAttributes{$attrib};
+			}
+			#  xxx/Node id="0x0011750101574014"/NodeDesc
+			if(0 && $path =~ m#Node id="(\w+)"/(NodeDesc|NodeType)# ) {
+				# %nodesDB has been populated
+				my $g = $1;
+				my $nodeAtrib = $2;
+				$nodesDB{$g}{$nodeAtrib} = $value if !$nodesDB{$g}{$nodeAtrib};
+			}
+		}
+
+		if($line =~ m|</(\w+)\b|) { $path =~ s|/$1\b.*$||; } # trim path
+		# should work for any data with one item per line.
+		# Therefore, not for opareport -o errors which mixes thresholds and values on one line
+	}
+	close $ff;
+
+	warn "Done getting state info for all switch ports\n";
+	$hasPortStates = 1;
+
+	# Step #2: From the cable data of each port, populate %cables{}
+	foreach my $port (keys %portsDB) {
+		my($g, $n) = split ';', $port;
+		$portsDB{$port}{NodeType} = $nodesDB{$g}{NodeType};
+		$portsDB{$port}{NodeDesc} = $nodesDB{$g}{NodeDesc};
+		my $cableID = $portsDB{$port}{CableInfo}{VendorName}. $portsDB{$port}{CableInfo}{VendorSN};
+		$portsDB{$port}{CableID} = $cableID;
+        	if($cableID) {
+                	$cables{$cableID}{Ends}++;
+                	$cables{$cableID}{Ports}[$cables{$cableID}{Ends}] = $port;
+        	}
+	}
+
+	# Step #3: For each cable that has 2 ends, populate %linksDB{}
+	foreach my $cableID (keys %cables) {
+		if($cables{$cableID}{Ends} == 2) {
+			my $p1 = $cables{$cableID}{Ports}[1];
+			my $p2 = $cables{$cableID}{Ports}[2];
+			if($linksDB{$p1} && $linksDB{$p1} ne $p2) {
+				warn "Internal Error: CableLink != FabricLink\n";
+				my $s = sprintf("   (p1) %s: FabricLink to %s, cableLink to %s\n",
+					portDesc($p1), portDesc($linksDB{$p1}), portDesc($p2));
+				warn $s;
+			} else {
+				$linksDB{$p1} = $p2;
+			}
+			if($linksDB{$p2} && $linksDB{$p2} ne $p1) {
+				warn "Internal Error: CableLink != FabricLink\n";
+				my $s = sprintf("   (p2) %s: FabricLink to %s, cableLink to %s\n",
+					portDesc($p2), portDesc($linksDB{$p2}), portDesc($p1));
+				warn $s;
+			} else {
+				$linksDB{$p2} = $p1;
+			}
+		} elsif($cables{$cableID}{Ends} == 1) {
+			; # $nSingleEnds++;
+		} else {
+			warn "Internal error: Cable $cableID has $cables{$cableID}{Ends} ends\n";
+		}
+	}
+}
+
+
+sub readTopology {
+	open my $ff, $optTopology || die;
+	while(<$ff>) {
+		chomp;
+		tr /\r//d;      # helps for files that have come from Windows
+		if(/^([\w ]+);(\d+);([\w ]+);(\d+)$/) {
+			my($d1, $n1, $d2, $n2) = split ';', $_;
+			my $p1 = sprintf('%s;%02d', $d1, $n1);
+			my $p2 = sprintf('%s;%02d', $d2, $n2);
+			$topoNodesDB{$d1}{NodeDesc} = $d1;
+			$topoNodesDB{$d1}{NodeType} = $d1 =~ /[ _]hfi\d.\d/i ? 'FI' : 'SW';
+			$topoPortsDB{$p1} = 1;
+			$topoNodesDB{$d2}{NodeDesc} = $d2;
+			$topoNodesDB{$d2}{NodeType} = $d2 =~ /[ _]hfi\d.\d/i ? 'FI' : 'SW';
+			$topoPortsDB{$p2} = 1;
+			$topoLinksDB{$p1} = $p2;
+			$topoLinksDB{$p2} = $p1;
+			push @topoLinks, "$p1;$p2"; # This is used for when we want to list things in the same order as the topofile.
+		} else {
+			warn "Unexpected record format in Topology file\n";
+		}
+	}
+	close $ff;
+}
+
+
+#### Read data from iba_extract_sel_links (An alternate data source)
+sub readSelLinks {
+    foreach (@inputData) {
+		next unless /^\w+;\d+;\w+;.*;\w+;\d+;\w+;.*$/;
+    		$hasLinks = 1;
+		my($g1, $p1, $t1, $d1, $g2, $p2, $t2, $d2) = split ';', $_;
+		$p1 = sprintf('%02d', $p1);
+		$p2 = sprintf('%02d', $p2);
+		$nodesDB{$g1}{NodeType} = $t1;
+		$nodesDB{$g1}{NodeDesc} = $d1;
+		$nodeGUID{$d1} = $g1;
+		$portsDB{"$g1;$p1"}{Exists} = 1;
+		$nodesDB{$g2}{NodeType} = $t2;
+		$nodesDB{$g2}{NodeDesc} = $d2;
+		$nodeGUID{$d2} = $g2;
+		$portsDB{"$g2;$p2"}{Exists} = 1;
+		push @fabLinks, "class;$g1;$p1;$g2;$p2";
+    }
+}
+
+
+
+
+
+########################
+########################
+#   End of data reading code
+########################
+
+
+#################################################################################################################
+#################################################################################################################
+#################################################################################################################
+# Data post processing subroutines
+
+
+
+
+sub makeReportPortsList {
+
+	# Populate @reportPortsList with a list of ports.
+	# One entry per port, or per link.
+	# If a link, then put the 'senior' port in @reportPortsList. The 'junior' port is discarded at this stage.
+	# Then sort this list for nice reporting.
+
+	my %portsDone;
+	foreach my $port (keys %portsDB) {
+		next if $portsDone{$port};
+		my($portL, $p1, $p2);
+		my $class = '';
+		if($portL = $linksDB{$port}) {
+			# This is a Link
+			# determine the order port/portL or portL/port
+			my ($g1, $n1) = split ';', $port;
+			my ($g2, $n2) = split ';', $portL;
+			     if($nodesDB{$g1}{NodeType} eq 'FI') {
+				$p2 = $port; $p1 = $portL; $class = '7_END';
+			} elsif($nodesDB{$g2}{NodeType} eq 'FI') {
+				$p1 = $port; $p2 = $portL; $class = '7_END';
+			} else {
+				# if( ($nodesDB{$g1}{NodeDesc} cmp $nodesDB{$g2}{NodeDesc}) < 0 ) {
+				if( statsCats($nodesDB{$g1}{NodeDesc}. $nodesDB{$g2}{NodeDesc}) eq statsCats($nodesDB{$g1}{NodeDesc}) ) {
+					$p1 = $port; $p2 = $portL;
+				} else {
+					$p1 = $portL; $p2 = $port;
+				}
+				# Set class
+				# if("$p1;$p2" =~ /[ _]S\d\d\d/) { # Spine. Incorrect - needs to use the NodeDesc if $p1;$p2
+				if( statsCats($nodesDB{$g1}{NodeDesc}. $nodesDB{$g2}{NodeDesc}) =~ /spine/i ) {
+					$class = '1_ISL';
+				} else {
+					$class = '2_ISL';
+				}
+			}
+			# push @reportPortsList, "$class|$p1";
+			($g1, $n1) = split ';', $p1;
+			push @reportPortsList, sprintf("%-5s%-20s%02d|", $class, $nodesDB{$g1}{NodeDesc}, $n1). $p1;
+			$portsDB{$p1}{Class} = $class;
+			$portsDone{$p1} = 1;
+			$portsDone{$p2} = 1;
+		} else {
+			# This is a Port
+			my($g1, $n1) = split ';', $port;
+			$p1 = $port;
+			$class = '8_PRT';
+			# push @reportPortsList, "$class|$p1" if $n1 != 0;
+			push @reportPortsList, sprintf("%-5s%-20s%02d|", $class, $nodesDB{$g1}{NodeDesc}, $n1). $p1 if $n1 != 0;
+			$portsDB{$p1}{Class} = $class;
+			$portsDone{$p1} = 1;
+		}
+	}
+	@reportPortsList = sort @reportPortsList;
+	@reportPortsList = map {s/^.*\|//;$_} @reportPortsList;	# strip the sort field off the front
+}
+
+
+
+
+
+
+
+
+# Time: text to seconds
+use Time::Local;
+sub parsedate {
+  my($s) = @_;
+  my($year, $month, $day, $hour, $minute, $second);
+
+  if($s =~ m{^\s*(\d{1,4})\W*0*(\d{1,2})\W*0*(\d{1,2})\W*0*
+                 (\d{0,2})\W*0*(\d{0,2})\W*0*(\d{0,2})}x) {
+    $year = $1;  $month = $2;   $day = $3;
+    $hour = $4;  $minute = $5;  $second = $6;
+    $hour |= 0;  $minute |= 0;  $second |= 0;  # defaults.
+    $year = ($year<100 ? ($year<70 ? 2000+$year : 1900+$year) : $year);
+    # return timelocal($second,$minute,$hour,$day,$month-1,$year);
+    return timegm($second,$minute,$hour,$day,$month-1,$year);
+  }
+  return -1;
+}
+
+
+
+#################################################################################################################
+#################################################################################################################
+#################################################################################################################
+# Printing/Output subroutines
+
+
+
+
+
+
+sub printFrontOfRow {
+	my $p1 = shift;
+	my $p2 = shift;
+	my $mode = shift;
+
+	# This subroutine prints something like this:
+	# END edge09.31            storage02_0.1  041700032          2c         -  
+	# Functions:
+	# 	Combine PortType and DeviceTechShort into a single 4-char field: 100o = 100m, Optical.
+	#	Shorten NodeDesc for HFIs
+
+	if($mode eq 'h') {
+		my $h;
+	    if(!$optNoCableSerial) {
+		#        ISL core02.39       edge03.35       041300138          3c
+		$h = "Typ Port1            Port2            Cable: Serial LenType";
+            } else {
+		#        ISL core02.39       edge03.35         3c
+		$h = "Typ Port1            Port2           Cable";
+	    }
+		return $h;
+	}
+
+	my ($g1, $n1) = split ';', $p1;
+	my ($g2, $n2) = split ';', $p2;
+	my $o = '';
+
+	# Combine PortType and DeviceTechShort into a single 4-char field
+	my $portUsage;
+	if($portsDB{$p1}{PortType} eq 'Standard') {
+		$portUsage = $portsDB{$p1}{CableInfo}{Length}. $portUsage;
+		# Length is 1 byte in QSFP spec, so I think it is only integer lengths, cannot represent a 1.5m cable.
+		# Also note that opareport appends an 'm' to the value
+		$portUsage =~ s/m$//;
+		if($portsDB{$p1}{CableInfo}{DeviceTechShort} =~ /AOC/) {
+			$portUsage .= 'o';		# Active could be confused with the PortState
+		} elsif($portsDB{$p1}{CableInfo}{DeviceTechShort} =~ /PassiveCu|Copper/) {
+			$portUsage .= 'c';
+		} else {
+			#$portUsage .= '?';
+		}
+	} elsif($portsDB{$p1}{PortType} eq 'Fixed') {
+			$portUsage = 'Fix';
+	} else {
+			$portUsage = '???';
+	}
+
+
+	# NodeDesc of HFI can be quite long, this printed with %-20s
+	# ISL core03.12            edge17.18            WV20J9X           10o         -  ErrorCounters
+	# END edge09.22            node293 hfi1_0.01    CN1549FA102L0378   1c         -  ErrorCounters
+	# END edge09.31            storage02 hfi1_0.01  041700032          2c         -  ErrorCounters
+
+	# Shorten HFI NodeDesc
+	my $pd1 = $nodesDB{$g1}{NodeDesc}. sprintf('.%02d', $n1);
+	my $pd2 = $p2 ? $nodesDB{$g2}{NodeDesc}. sprintf('.%02d', $n2) : '-';
+	$pd1 =~ s/ hfi1_(\d).0(\d)/_$1.$2/; # Saves 6 chars
+	$pd2 =~ s/ hfi1_(\d).0(\d)/_$1.$2/;
+
+	# Print it
+	#	Class Port1 Port2 Cserial Clen/type Slow
+    if(!$optNoCableSerial) {
+	$o .= sprintf('%s %-16s %-16s %-16s %4s',
+		substr($portsDB{$p1}{Class}, 2, 3),
+		substr($pd1, -16), substr($pd2, -16),
+		$portsDB{$p1}{CableInfo}{VendorSN} ? $portsDB{$p1}{CableInfo}{VendorSN} : '-',	# 16 chars, defined by QSFP spec
+		$portUsage);
+    } else {
+	$o .= sprintf('%s %-16s %-16s %4s',
+		substr($portsDB{$p1}{Class}, 2, 3),
+		$pd1, $pd2,
+		$portUsage);
+    }
+	return $o;
+}
+
+
+sub printSlowIndicator {
+	my $p1 = shift;
+	my $p2 = shift;
+
+	# Contruct a 'Slow' indicator
+	my $speedIndicator = '';
+	if($portsDB{$p1}{PhysState} eq 'LinkUp') {
+	   if(0) {
+		# Should look for LinkWidthDnGradeTxActive or LinkWidthDnGradeRxActive being lower than the lower of LinkWidthSupported on p1 & p2.
+		# This code has been tested. Requires adding LinkWidthSupported_Int LinkWidthDnGradeTxActive_Int LinkWidthDnGradeRxActive_Int to %requiredAttributes.
+		my $targetLinkWidth = $portsDB{$p1}{LinkWidthSupported_Int} & $portsDB{$p2}{LinkWidthSupported_Int};  # = bits/width common to both ends
+		# I want just the highest speed, so find the msb
+		my $b; for($b=0x08; $b; $b = $b>>1) { last if $targetLinkWidth & $b; }; $targetLinkWidth = $b;
+		if($portsDB{$p1}{LinkWidthDnGradeTxActive_Int} < $targetLinkWidth || $portsDB{$p1}{LinkWidthDnGradeRxActive_Int} < $targetLinkWidth) {
+			$speedIndicator .= '/' if $speedIndicator;
+			$speedIndicator .= $portsDB{$p1}{LinkWidthDnGradeTxActive}. 'x'. $portsDB{$p1}{LinkWidthDnGradeRxActive}. 'x';
+		}
+	   }
+		# For now I will assume 4. Likewise for Speed, I will assume 25Gb.
+		if($portsDB{$p1}{LinkSpeedActive} ne '25Gb') {
+			$speedIndicator .= $portsDB{$p1}{LinkSpeedActive};
+		}
+		if($portsDB{$p1}{LinkWidthDnGradeTxActive} != 4 || $portsDB{$p1}{LinkWidthDnGradeRxActive} != 4) {
+			$speedIndicator .= '/' if $speedIndicator;
+			$speedIndicator .= $portsDB{$p1}{LinkWidthDnGradeTxActive}. 'x'. $portsDB{$p1}{LinkWidthDnGradeRxActive}. 'x';
+		}
+	}
+	$speedIndicator = '-' if !$speedIndicator;
+
+	my $w = 9; # Center-justify in $w chars.
+	$speedIndicator .= substr('            ', 0, int(($w-length($speedIndicator))/2) ); # pad the right side with 1/2 the spaces.
+	$speedIndicator = sprintf('%'. $w. 's', $speedIndicator);	# Let sprintf pad the left side with spaces.
+}
+
+sub printActive {
+	# This is test code, not used.
+	print "\n";
+	print "Active links with Errors\n";
+	my $n = 0;
+	foreach my $p1 (@reportPortsList) {
+		my $reason = '';
+		my $o = '';
+		if( ($portsDB{$p1}{PortState} eq 'Active') && $portsDB{$p1}{Errors} ) {
+			# This is a link with error
+			$n++;
+			my $p2 = $linksDB{$p1};
+			$o .= printFrontOfRow($p1, $p2). ' ';
+			my ($g1, $n1) = split ';', $p1;
+			my ($g2, $n2) = split ';', $p2;
+			$reason = 'ErrorCounters';
+			$o .= " $reason";
+			print "$o\n" if $reason;
+		}
+	}
+	print "None\n" if $n == 0;
+}
+
+
+
+#### Print errors
+sub printErrors {
+
+    my $o;
+    my $deltaData;
+    my $dataTimeStamp;
+    my $tDiff;
+
+    if(!$optDelta) {
+    	if( (!$inputFile) && (-f $timeStampFile) ) {
+		open FF, "$timeStampFile" || die;
+		my @d = (<FF>);
+		close FF;
+		$dataTimeStamp = $d[0];
+	}
+    } else {
+	# Delta
+	my($VAR1, $VAR2);
+	open FILE, $deltaDataFile;
+	undef $/;
+	eval <FILE>;
+	close FILE;
+	$deltaData = $VAR1;
+	$dataTimeStamp = $$VAR2;
+    }
+
+    if($dataTimeStamp) {
+	my $t1 = parsedate($tNow);
+	my $t0 = parsedate($dataTimeStamp);
+	my $t  = ($t1 - $t0)/60;
+	if($t <= 60) {
+	    	$tDiff = sprintf("%0.1f minutes", $t);
+	} else {
+    		$tDiff = sprintf("%0.1f hours", $t/60);
+	}
+    } else {
+		$tDiff = 'unknown';
+    }
+    $o .= "\n";
+    $o .= "Time since cleared: $tDiff.\n";
+
+    # Print column headings
+    $o .= "Active links with Errors\n";
+    $o .= printFrontOfRow(0, 0, 'h'). '    Slow  End ';
+    foreach my $e (@errorList) {
+	next if $e eq 'Slow';
+	$o .= sprintf("%6s ", $shortErrorNames{$e}) if $errorBit{$e} & $errorsSelectedMask;
+    }
+    print "$o\n";
+
+    my %allErrors;
+    my $allErrorsMask;
+
+
+    foreach my $p1 (@reportPortsList) {
+	my $p2 = $linksDB{$p1};
+	next unless ($portsDB{$p1}{PortState} eq 'Active') && ($portsDB{$p1}{Errors} || $portsDB{$p2}{Errors});
+	next if $portsDB{$p1}{Class} =~ /END/i && $optNoFIs;
+	my ($g1, $n1) = split ';', $p1;
+	my ($g2, $n2) = split ';', $p2;
+	# Get totals of each error type (for printing "errors which have not been selected")
+	foreach my $e (@errorList) {
+		$allErrors{$e}++ if ($portsDB{$p1}{$e} || $portsDB{$p2}{$e});
+		$allErrorsMask = $allErrorsMask | $portsDB{$p1}{Errors} | $portsDB{$p2}{Errors};
+	}
+	# Print links with selected errors
+	my $eFlag = 0;
+	$eFlag |= 0x01 if $portsDB{$p1}{Errors} & $errorsSelectedMask;
+	$eFlag |= 0x02 if $portsDB{$p2}{Errors} & $errorsSelectedMask;
+	my $end = qw(-- << >> <>)[$eFlag];
+	if($eFlag) {
+		my $f2 = 0;
+		my $o = printFrontOfRow($p1, $p2). ' ';
+		# The Slow bit needs to have been set for this to print, which needs opareport -o slowlinks to set it
+		if(exists $portsDB{$p1}{LinkWidthDnGradeTxActive}) {
+			# The xml port data has been collected, we will use that to determine if Slow
+			my $v = printSlowIndicator($p1, $p2);
+			$o .= $v;
+			$f2 = 1 if $v !~ /-/;
+		} else {
+			# Otherwise we will use the data from opareport -o slowlinks
+			if($portsDB{$p1}{Slow}) {
+				$o .= $portsDB{$p1}{Slow};
+				$f2 = 1;
+			} else {
+				$o .= '    -    ';
+			}
+		}
+		$o .= ' '. $end. ' ';
+		foreach my $e (@errorList) {
+			next if !($errorBit{$e} & $errorsSelectedMask);
+			next if $e =~ /Slow/;
+			if($e =~ /Slow/) {
+				# This code no longer used
+				my $v = '-';
+				if($portsDB{$p1}{$e}) {
+					$v = $portsDB{$p1}{$e};
+					$f2 = 1;
+				}
+				$o .= sprintf("%7s ", $v);
+			} elsif($e eq 'LinkQualityIndicator') {
+				# LinkQualityIndicator is not a counter
+				#    (makes no sense to compare with delta)
+				my $v1 = $linkQualityIndicatorThreshold;
+				$v1 = $portsDB{$p1}{$e} if defined($portsDB{$p1}{$e}) && ($portsDB{$p1}{$e} < $v1);
+				$v1 = $portsDB{$p2}{$e} if defined($portsDB{$p2}{$e}) && ($portsDB{$p2}{$e} < $v1);
+				if($v1 < $linkQualityIndicatorThreshold) {
+					$f2 = 1;
+				} else {
+					$v1 = '-';
+				}
+				$o .= sprintf("%6s ", $v1);
+			} else {
+				# Ordinary counter
+				my $v1 = $portsDB{$p1}{$e} + $portsDB{$p2}{$e};
+				if($optDelta) {
+					my $v0 = ${$deltaData}{$p1}{$e} + ${$deltaData}{$p2}{$e};
+					$v1 -= $v0;
+					# clr bit in allErrors if $v1 < 1. Could this logic be cleaner?
+					# $allErrors{$e}-- if $v1 < 1;
+					# $allErrorsMask = $allErrorsMask & ~$errorBit{$e};
+				}
+				$o .= sprintf("%6d ", $v1);
+				$f2 = 1 if $v1;
+			}
+		}
+		print "$o\n" if $f2;
+	}
+    }
+
+    # print errors which have not been selected
+    print "Number of links with other error types:\n";
+    my $none = 1;
+    foreach my $e (@errorList) {
+	next if $errorBit{$e} & $errorsSelectedMask;
+	if( $allErrors{$e} ) {
+		printf("%30s: %5d\n", $e, $allErrors{$e});
+		$none = 0;
+	}
+    }
+    if($none) {
+    	print "      None.\n";
+    } else {
+	print  "          This may over-report in delta mode\n" if $optDelta;
+    	printf("          To list all current errors, use --errorMask=0x%x\n", $allErrorsMask);
+    }
+}
+
+sub printNonActive {
+
+	print printFrontOfRow(0, 0, 'h'). '    Slow    Port1 state     Port2 state'. "\n";
+	my $n = 0;
+	foreach my $p1 (@reportPortsList) {
+		my $reason = '';
+		my $o = '';
+		if( ($portsDB{$p1}{PortState} ne 'Active') && ($portsDB{$p1}{PhysState} ne 'Offline') &&
+				($portsDB{$p1}{PortType} ne 'Fixed')) {
+			# This is a Link or Port that is Down
+			$n++;
+			my $p2 = $linksDB{$p1};
+			$o .= printFrontOfRow($p1, $p2). ' '. printSlowIndicator($p1, $p2);
+			my ($g1, $n1) = split ';', $p1;
+			my ($g2, $n2) = split ';', $p2;
+			$reason = 'Down';
+			$o .= sprintf('  %-15s %-15s',
+				      "$portsDB{$p1}{PortState}/$portsDB{$p1}{PhysState}",
+				$p2 ? "$portsDB{$p2}{PortState}/$portsDB{$p2}{PhysState}" : '-');
+			# Note - PhysState etc not available for FIs $nodesDB{$g2}{NodeType}
+			print "$o\n" if $reason;
+		}
+	}
+	print "None\n" if $n == 0;
+}
+
+
+
+sub compactNames {
+	my $len = 17;
+	foreach my $guid (keys %nodesDB) {
+		my $desc = $nodesDB{$guid}{NodeDesc};
+		$desc =~ s/ /_/g;
+		$desc = '~'. substr($desc, -($len-1)) if length($desc) > $len;
+		$nodesDB{$guid}{shortDesc} = $desc;
+        }
+}
+
+
+
+sub statsCats {
+	my $desc = shift;
+	my $c;
+	   if($desc =~ /spine/i		) { $c = 'SpineSWs' }
+	elsif($desc =~ /[ _]S\d\d\d/	) { $c = 'SpineSWs' }
+	elsif($desc =~ /leaf/i		) { $c = 'LeafSWs'  }
+	elsif($desc =~ /[ _]L\d\d\d/	) { $c = 'LeafSWs'  }
+	elsif($desc =~ /core/i		) { $c = 'SpineSWs' }  # Importantly after testing for leaf
+	elsif($desc =~ /edge/i		) { $c = 'EdgeSWs'  }
+	elsif($desc =~ /r...u(41|42|02|08)/) { $c = 'EdgeSWs'  } # for Cineca
+	else				  { $c = 'OtherSWs' }
+	return $c
+}
+
+sub printStats {
+	my @statNames = qw(
+	FI-Ports
+	SWs
+	ISLs
+	SpineSWs
+	LeafSWs
+	EdgeSWs
+	OtherSWs
+	SpineISLs
+	LeafISLs
+	OtherISLs
+	);
+
+	my %stats;		# $stats{Fab|Top}{statName} = value
+
+	# Fabric nodes
+	foreach my $g1 (keys(%nodesDB)) {
+		next unless $g1 =~ /^0x0/;
+		if($nodesDB{$g1}{NodeType} eq 'FI') {
+			$stats{Fab}{'FI-Ports'}++;
+		} else {
+			my $d1 = $nodesDB{$g1}{NodeDesc};
+			my $c = statsCats($d1);
+			$stats{Fab}{SWs}++;
+			$stats{Fab}{$c}++;
+		}
+	}
+	# Fabric links
+	foreach my $p1 (@reportPortsList) {
+		# A convenient list, containing one end of each link (plus ports that are not in a link).
+		my ($g1, $n1) = split ';', $p1;
+		if($portsDB{$p1}{PortState} eq 'Active' && (my $p2 = $linksDB{$p1})) {
+			my ($g2, $n2) = split ';', $p2;
+			if($nodesDB{$g1}{NodeType} ne 'FI' && $nodesDB{$g2}{NodeType} ne 'FI') {
+				my $c = statsCats($nodesDB{$g1}{NodeDesc}. $nodesDB{$g2}{NodeDesc});
+				$stats{Fab}{ISLs}++;
+				$c =~ s/SWs/ISLs/;
+				$stats{Fab}{$c}++;
+			}
+		}
+	}
+	# Topo nodes
+    if($optTopology) {
+	foreach my $d1 (keys(%topoNodesDB)) {
+		if($topoNodesDB{$d1}{NodeType} eq 'FI') {
+			$stats{Top}{'FI-Ports'}++;
+		} else {
+			my $c = statsCats($d1);
+			$stats{Top}{SWs}++;
+			$stats{Top}{$c}++;
+		}
+	}
+	# Topo links
+	foreach my $link (@topoLinks) {
+		next if $link =~ /[ _]hfi\d.\d/i;	# Slightly kludgy
+		my $c = statsCats($link);
+		$stats{Top}{ISLs}++;
+		$stats{Top}{SpineISLs}++ if $c eq 'SpineSWs';
+		$stats{Top}{LeafISLs}++ if $c eq 'LeafSWs';
+	}
+    }
+		
+
+	# Print
+	printf("%15s  %8s   %8s   %12s\n", '', 'Fabric', 'File', 'Difference');
+	# foreach my $c (keys %{$stats{Fab}} ) {
+	foreach my $c (@statNames) {
+		my $diff = $stats{Fab}{$c} - $stats{Top}{$c};
+		if($diff > 0) { $diff = '+'. $diff; }
+		elsif($diff == 0) { $diff = '0'; }
+		printf("%15s  %8d   %8d   %12s\n", $c, $stats{Fab}{$c}, $stats{Top}{$c}, $diff);
+	}
+
+
+}
+
+
+sub printSMservers {
+	print "\n";
+	print "SM Servers:\n";
+	foreach (@smServers) {
+		my($guid, $state) = split ';', $_;
+		if($guid !~ /^0x/) {
+			$guid = $nodeGUID{$guid};
+		}
+		printf(" %20s: %s\n", $nodesDB{$guid}{NodeDesc}, $state);
+	}
+}
+
+
+#### Initialize @errorList, %shortErrorNames, %errorBit
+# These are effectively constants
+sub initErrorLists {
+
+	my @errors;
+if(0) {
+     @errors = qw(
+	Slow				Slow
+
+        SymbolErrorCounter		Symb
+        LinkErrorRecoveryCounter	Lrec
+        LinkDownedCounter		Ldwn
+        PortRcvErrors			PrtR
+
+	PortRcvRemotePhysicalErrors	RmtE
+	PortRcvSwitchRelayErrors	RlyE
+        PortXmitDiscards		TxDc
+        PortXmitConstraintErrors	Xcnt
+
+        PortRcvConstraintErrors		Rcnt
+        LocalLinkIntegrityErrors	Lint
+        ExcessiveBufferOverrunErrors	ExBf
+	VL15Dropped			VL15
+        );
+
+} else {
+     @errors = qw(
+	Slow				 Slow
+
+	LinkQualityIndicator             Qual
+	LocalLinkIntegrityErrors         Lint
+	LinkErrorRecovery                Lrec
+	UncorrectableErrors              Uerr
+
+	RcvErrors                        RcvE
+	FMConfigErrors                   FMcf
+	LinkDowned                       Ldwn
+	XmitDiscards                     TxDc
+
+	CongDiscards                     CnDc
+	ExcessiveBufferOverruns          ExBf
+	RcvRemotePhysicalErrors          RmtE
+	RcvSwitchRelayErrors             RlyE
+
+        );
+
+#	RcvConstraintErrors              Rcnt
+#	RcvFECN                          RxFN
+#	RcvBECN                          RxBN
+#	MarkFECN                         MaFN
+#
+#	XmitTimeCong                     TxTc
+#	XmitWait                         TxWt
+#	XmitWastedBW                     TxWs
+#	XmitWaitData                     TxWd
+#
+#	RcvBubble                        RxBl
+
+}
+
+	my $n = 0;
+	while (scalar(@errors)) {
+		my $nameL = shift @errors;
+		my $nameS = shift @errors;
+		push @errorList, $nameL;
+		$shortErrorNames{$nameL} = $nameS;
+		$errorBit{$nameL} = 0x1000 >> $n++;
+	}
+}
+
+
+
+
+
+
+
+
+
+#### Main #########################################################################
+#### Main #########################################################################
+#### Main #########################################################################
+#
+
+# Get time now
+	{
+		my @f = localtime time;
+		$tNow = sprintf "%d-%02d-%02d", 1900+$f[5],$f[4]+1,$f[3];
+		$tNow .= ' '.sprintf "%02d:%02d:%02d", $f[2],$f[1],$f[0];
+	}
+
+# Clear and Timestamp
+if($optClr) {
+	my $cmd;
+	if($inputType eq 'ibDiag') {
+		$cmd = "ibqueryerrors $ibDiag_args --clear-errors";
+	} else {
+		$cmd = "opareport $hca $iba_args -o none -C";
+	}
+	open FF, "$cmd |" || die;
+	my $v = <FF>;
+	close FF;
+	open FF, ">$timeStampFile" || die;
+	print FF "$tNow\n";
+	close FF;
+	exit 0;
+}
+
+
+# Get data: run command or open datafile
+{
+    my $openInFile;
+    if($inputFile) {
+	if($inputFile =~ /stdin/i) {
+		$openInFile = '-';
+	} else {
+		$openInFile = $inputFile;
+	}
+    } else {
+	my $cmd;
+	if($inputType eq 'ibaReport') {
+		$cmd = "opareport $hca $iba_args -o slowlinks -o errors -o brcomps -o links ";
+	} elsif($inputType eq 'ibaSelLinks') {
+		$cmd = "iba_extract_sel_links $hca $iba_args";
+	} elsif($inputType eq 'ibDiag') {
+		$cmd = "(ibqueryerrors $ibDiag_args; iblinkinfo $ibDiag_args --line)";
+	}
+	$openInFile = "$cmd |";
+	$openInFile = "opareport.01" if -e "opaerrs_testmode";
+    }
+    open my $ff, $openInFile || die;
+    @inputData = (<$ff>);
+    chomp @inputData;
+    close $ff;
+    unlink $thresholdFile if -f $thresholdFile;
+}
+
+
+
+
+	initErrorLists();
+	# input and sort
+	readTopology() if $optTopology;
+	if($inputType eq 'ibaReport') {
+		readIbaReport();
+		getAllPortData() unless $optNoPortState;
+		makeReportPortsList();
+	} elsif($inputType eq 'ibaSelLinks') {
+		readSelLinks();
+	} elsif($inputType eq 'ibDiag') {
+		readIBdiag();
+	}
+	print "\n" if !$inputFile;	# Add a newline if we ran iba_report
+
+    if(0) {
+	my $g2 = '0xDummy'; my $p2 = '00';
+	$nodesDB{$g2}{NodeDesc} = $nodesDB{$g2}{shortDesc} = 'unknown';
+	$portsDB{"$g2;$p2"}{Exists} = 1;
+    }
+
+	# orientLinks();
+	# sortLinks();
+	# compactNames();
+	# statsCollect();
+
+	# Output
+	print "Date: $tNow\n";
+
+	my %cmd = ('ibaReport', 'opareport -o links', 'ibaSelLinks', 'iba_extract_sel_links', 'ibDiag', 'iblinkinfo --line');
+
+	if($hasLinks) {
+		printStats();
+	} else {
+		print qq|Cannot show fabric stats, "$cmd{$inputType}" not provided in input data.\n|;
+	}
+	printSMservers() if scalar(@smServers);
+	printErrors() if $hasErrorReport;
+	print "\n";
+	print "Non-Active Links and Ports (Ports in PhysState:Offline are not shown)\n";
+	if(!$hasPortStates) {
+		if($optNoPortState) {
+			print "PortState not collected (--noPortStates)\n";
+		} else {
+			print "PortState not available\n";
+		}
+	} else {
+		printNonActive();
+	}
+	if($optSnap) {
+		$Data::Dumper::Purity = 1;
+		open my $ff, ">$deltaDataFile" or die;
+		print $ff Dumper(\%portsDB, \$tNow);
+		close $ff;
+	}
+	if($optVerify ne 'no') {
+		if($hasLinks) {
+			verifyLinks();
+		} else {
+			print qq|Cannot verify fabric links, "$cmd{$inputType}" not provided in input data.\n|;
+		}
+	}
+
+

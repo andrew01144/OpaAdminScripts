@@ -1,0 +1,105 @@
+#!/usr/bin/perl
+
+use strict;
+
+=pod
+    ToDo
+	Add 4X 10.0Gbps
+	Sort nodes, FIs first (by chance, ok for now)
+	Check -d level options
+	Input args
+		one line (-l Print all information for each link on one line.)
+		active links (-d Print only nodes which have a port in the "Down" state.)
+		opareport args
+
+    Interesting
+	Odd that I need to fiddle with NodeLID vs PortInfo.LID.
+		Maybe I should focus on PortInfo for FIs, thus also showing PortInfo.GUID.
+	I assume the ( ) at the end of the line is always empty.
+	I don't knbow what should be in the [  ].
+
+=cut
+
+=pod
+ 0 Node.NodeGUID
+ 1 PortInfo.PortNum
+ 2 Node.NodeType
+ 3 Node.NodeDesc
+ 4 Node.LID
+ 5 PortInfo.LID
+ 6 PortState
+ 7 PhysState
+ 8 LinkWidthActive
+ 9 LinkSpeedActive
+ 9 OfflineDisabledReason
+10 Length
+11 VendorName
+12 VendorPN
+13 VendorSN
+14 PortInfo.Neighbor.Port.NodeGUID
+15 PortInfo.Neighbor.Port.PortNum
+16 PortInfo.Neighbor.Port.NodeDesc
+
+
+=cut
+
+my %data;
+
+#### Step 1. Populate hte %data hash
+for my $line ( qx% opareport -o nodes -d 5 -A -x | opaxmlextract -H -s Focus -e Node.NodeGUID -e PortInfo.PortNum -e Node.NodeType -e Node.NodeDesc -e Node.LID -e PortInfo.LID -e PortState -e PhysState -e LinkWidthActive -e LinkSpeedActive -e OfflineDisabledReason -e Length -e VendorName -e VendorPN -e VendorSN -e PortInfo.Neighbor.Port.NodeGUID -e PortInfo.Neighbor.Port.PortNum -e PortInfo.Neighbor.Port.NodeDesc -s SMs % ) {
+
+	my @a = split ';', $line;
+	# print "xx $a[0] \n";
+	$data{$a[0]} = {} unless $data{$a[0]};
+	$data{$a[0]}{NodeType} = $a[2];
+	$data{$a[0]}{NodeDesc} = $a[3];
+	if($a[2] eq 'SW') {
+		$data{$a[0]}{NodeLID} = hex($a[4]) if $a[1];
+	} else {
+		$data{$a[0]}{NodeLID} = hex($a[5]) if $a[1];
+	}
+	$data{$a[0]}{ports}[$a[1]]{PortNum} = $a[1];
+	$data{$a[0]}{ports}[$a[1]]{PortState} = $a[6] ? $a[6] : '-';
+	$data{$a[0]}{ports}[$a[1]]{PhysState} = $a[7] ? $a[7] : '-';
+	$data{$a[0]}{ports}[$a[1]]{LinkWidthActive} = $a[8] ? $a[8] : '-';
+		$data{$a[0]}{ports}[$a[1]]{LinkWidthActive} =~ s/(\d)/$1X/;
+	$data{$a[0]}{ports}[$a[1]]{LinkSpeedActive} = $a[9] ? $a[9] : '-';
+	$data{$a[0]}{ports}[$a[1]]{NeighborNodeGUID} = $a[15] ? $a[15] : '-';
+	$data{$a[0]}{ports}[$a[1]]{NeighborPortNum} = $a[16] ? $a[16] : '-';
+	
+}
+
+#### Step 2. Report
+foreach my $guid ( sort keys(%data) ) {
+	if($data{$guid}{NodeType} eq 'SW') {
+		print "Switch: $guid $data{$guid}{NodeDesc}:\n";
+	} else {
+		print "FI: $data{$guid}{NodeDesc}:\n";
+	}
+	foreach my $port ( @{ $data{$guid}{ports} } ) {
+		next if $port->{PortNum} == 0;
+		# ports seem to come out in numerical order, so I don't need to sort
+		my $g1 = $guid;
+		my $g2 = $port->{NeighborNodeGUID};
+		#           11    1[  ] ==(                Down/   Sleep)==>
+		my $p1 = sprintf("%5d %5d[  ] ==( %-4s %4.1f Gbps %8s/ %8s)==>",
+			$data{$g1}{NodeLID}, $port->{PortNum},
+			$port->{LinkWidthActive}, $port->{LinkSpeedActive},
+			$port->{PortState}, $port->{PhysState});
+		# ==>       5    1[  ] "snoopy08 HCA-1" ( )
+		# ==>             [  ] "" ( )
+		my $p2 = qq|           [  ] "" ( )|;	# for an offline destination port
+		if($port->{NeighborPortNum} > 0) {
+			$p2 = sprintf(qq|%5d %5d[  ] "%s" ( )|,
+				$data{$g2}{NodeLID}, $port->{NeighborPortNum}, $data{$g2}{NodeDesc});
+		}
+		if($data{$g1}{NodeType} eq 'SW') {
+			print "       $p1 $p2\n";
+		} else {
+			print "       $g1 $p1 $p2\n";	# Maybe g1 should be PortGUID, not NodeGUID?
+		}
+	}
+}
+
+
+

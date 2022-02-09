@@ -1,0 +1,161 @@
+#!/usr/bin/perl
+
+use strict;
+
+sub usage {
+	my $usageText = qq@usage: opaextractsellinks | topoDirectorCheck [--nSlinks <N>]
+Performs a quick fabric check of all directors.
+   1) Shows the number of spines and leafs in each director.
+   2) Detects any missing internal spine links.
+
+Options:
+   --nSlinks   Number of spine links expected on each leaf. Default 16.
+
+   Accepts data in two formats:
+   1) 0x001175010250198c;26;SW;phs1swivd10u07 L104B;0x00117501026c160b;23;SW;phs1swivd10u07 S207B
+   2) phs1swivd10u07 S202A;01;phs1swivd10u07 L115A;48
+
+@;
+	warn $usageText;
+	exit 1;
+}
+
+
+=cut
+
+Thoughts on how to set $nISLsExpected.
+
+1) Fixed 16. OK for most OPA directors.
+	Will fail if over- or under- populated with spines.
+	Will not work with TS directors, which are typically 18.
+
+2) Default to 16. Command line option to override.
+
+
+3) Automatically guess it for each director.
+	Too clever? Prone to error and/or confusion?
+	$nISLsExpected should be $nSpines x Leaf-Spine-Bundle-Width.
+	Leaf-Spine-Bundle-Width for various directors is:
+			TS 12800-360	1
+			TS 12800-180	2
+			TS 12800-120	3
+			TS 12800-060	6 (never built)
+			TS 12800-040	9
+			OPA 100-24	1
+			OPA 100-06	4
+	We don't know the model of director, so how to we determine the Leaf-Spine-Bundle-Width?
+	Determine nISLsMax, the maximum number of ISLs found on any leaf in this director.
+	Then ???
+
+X) Could also list Spines whose link count is not equal to the number of leafs.
+			
+
+=cut
+
+use Getopt::Long;
+my $nISLsExpected;	# The number of ISLs I expect on each leaf
+my $optHelp;
+
+GetOptions(
+	'nSlinks:i' => \$nISLsExpected,
+	'help' => \$optHelp,
+) or usage();
+usage() if $optHelp;
+
+$nISLsExpected = 16 if !defined $nISLsExpected;	# 16 is corerct for most OPA gen1 directors
+
+my %nodes;
+my %directors;
+
+my @links = (<>);
+@links = grep / S[12]\d\d/, @links;	# only internal links, ie links on a Spine
+
+if(! @links) {
+	print "No Directors found.\n";
+	exit 0;
+}
+
+# Make a list of NodeDescs and Directors
+foreach my $l (@links) {
+	chomp $l;
+	my @a = split ';', $l;
+	my($d1, $d2);
+	if(@a == 8) {
+		# opaextractsellinks
+		$d1 = $a[3]; $d2 = $a[7];
+	} elsif (@a == 4) {
+		# simple node;port;node;port
+		$d1 = $a[0]; $d2 = $a[2];
+	} else {
+		die "Unexpected input format";
+	}
+	# Could add: ignore comments, ignore blank lines, duplicate port check
+	foreach my $node ($d1, $d2) {
+		$nodes{$node}++;
+		$node =~ s/ [SL]\d\d\d[AB]*//;
+		$directors{$node}++;
+	}
+}
+
+# Count spines and leafs
+print "Director chassis switch count:\n";
+foreach my $director (sort keys %directors) {
+	my $nSpines = grep /$director S[12]\d\d/, keys %nodes;
+	my $nLeafs  = grep /$director L[12]\d\d/, keys %nodes;
+	my $warning = $nISLsExpected % $nSpines ?
+		",   Warning: Expected links per leaf ($nISLsExpected) is not a multiple of nSpines ($nSpines)." : '';
+	printf("  %-12s Spines: %2d, Leafs: %2d%s\n", $director, $nSpines, $nLeafs, $warning);
+}
+
+
+# Count the ISLs on each leaf.
+my @leafs = sort(grep / L[12]\d\d/, keys %nodes);	# Make a list of leafs
+my @out;
+my $linksExpected = 0;
+my $linksMissing = 0;
+my $linksUnexpected = 0;
+foreach my $leaf (@leafs) {
+	my $nISLs = grep /$leaf/, @links;
+	# print "  $leaf: $nISLs\n" if $nISLs != $nISLsExpected;
+	push @out, "$leaf: $nISLs" if $nISLs != $nISLsExpected;
+	my $nDiff = $nISLsExpected - $nISLs;
+	$linksExpected += $nISLsExpected;
+	$linksMissing    += $nDiff if $nDiff >0;
+	$linksUnexpected += $nDiff if $nDiff <0;
+}
+
+# Print report
+my $errorStat = 0;
+if(@out) {
+	print "Leafs with unexpected number of Spine links (Expected = $nISLsExpected).\n";
+	$errorStat = 1;
+	foreach my $l (@out) {
+		print "  $l\n";
+	}
+	print "Link totals: Expected: $linksExpected, Missing: $linksMissing, Unexpected: $linksUnexpected.\n";
+} else {
+	print "All Leafs have $nISLsExpected Spine links.\n";
+}
+
+exit $errorStat;
+
+=cut
+
+Here is a much simpler version.
+But it requires a links list and a node list, which is not so easy to run offline.
+
+#!/bin/bash
+
+opaextractsellinks | grep ' S[12]' > internalLinks.txt
+IFS=$'\n'
+for leaf in $(opaextractlids |cut -d \; -f 4 | grep ' L[12]')
+do
+        nISLs=$(grep -c $leaf internalLinks.txt)
+        if [ "$nISLs" -ne 16 ]; then
+                echo $leaf $nISLs
+        fi
+done
+unset IFS
+
+=cut
+

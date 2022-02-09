@@ -1,0 +1,52 @@
+#!/usr/bin/perl
+
+
+# Usage: opaSwitchQueryFanSpeeds 0x001175010262f0fe
+# Usage: for guid in $(grep '^0x' /etc/sysconfig/opa/switches); do opaSwitchQueryFanSpeeds $guid; done
+
+
+use strict;
+my $guid = $ARGV[0];
+
+=cut
+
+Example:
+for guid in $(grep '^0x' /etc/sysconfig/opa/switches); do ./opaSwitchQueryFanSpeeds $guid; done
+0x001175010262f0fe,core01,2     8648    8628    8578    8598    8583    8568
+0x001175010262f027,core02,2     8603    8573    8608    8613    8733    8623
+0x001175010262fee8,core03,2     8603    8653    8613    8613    8593    8603
+0x001175010262f037,core04,2     8623    8598    8573    8688    8598    8673
+0x001175010262ed00,core05,2     8603    8564    8623    8643    8678    8693
+
+=cut
+
+
+open my $ff, "/usr/lib/opa/tools/opaswquery -t $guid -Q 7 -v 2>/dev/null |" or die;
+my @data = (<$ff>);
+close $ff;
+
+if($data[$#data] !~ /opaswquery completed/) {
+	die "Internal Error - opaswquery did not complete";
+	exit 1;
+}
+
+my @speeds = ();
+my $i=0;
+foreach my $l (@data) {
+	if($l =~ /Fan speed is (\d+)\b/) {
+		$speeds[$i++] = $1;
+	}
+}
+
+if($i != 6) {
+	die "Internal Error - speeds not found";
+	exit 1;
+}
+
+my $o = "$guid\t";
+foreach my $fan (0..5) {
+	$o .= $speeds[$fan]. "\t";
+}
+print "$o\n";
+
+

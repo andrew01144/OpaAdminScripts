@@ -1,0 +1,321 @@
+#!/usr/bin/perl
+
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+
+sub usage {
+	print "Usage: extractFromSnapshot.pl [--info|--links|--lids|--errors|--help] snapshot.xml\n";
+	exit 1;
+}
+
+sub optHelp {
+	print "Usage: extractFromSnapshot.pl [--info|--links|--lids|--errors|--help] snapshot.xml\n";
+	print "
+
+This reads a snapshot file created with iba_report -o snapshot, and emulates
+fabric_info, iba_extract_sel_links, iba_extract_lids and iba_report -o errors.
+It can be run in any Perl environment (PC or Linux), with or without IFS.
+
+Examples:
+    extractFromSnapshot --info snapshot.xml
+    cat snapshot.xml.gz | gunzip | extractFromSnapshot --links
+
+Note: there may be a short delay while it processes the node records before
+it provides any output.
+";
+	exit 0;
+}
+
+=cut
+Written by Andrew.Russell@Intel.com, September 2014.
+
+Design notes:
+
+I did try using a proper XML handling library, but it was too slow.
+(That was on my 800MHz microserver running CentOS 5.7)
+http://www.perlmonks.org/?node_id=1029432 says it may be ok on CentOS 6, but I have not tried it.
+Anyway, I also notice that I can't rely on XML::LibXML being available,
+so that is another reason to use my own code.
+
+This code makes certain assumptions about the layout of the xml file,
+but works quite happily on iba_report snapshots.
+
+=cut
+
+
+my $optInfo = 0;
+my $optLinks= 0;
+my $optLids = 0;
+my $optErrs = 0;
+my $optHelp = 0;
+
+GetOptions(
+	'info'	=> \$optInfo,
+	'links'	=> \$optLinks,
+	'lids'  => \$optLids,
+	'errors'  => \$optErrs,
+	'help'  => \&optHelp,
+) or usage();
+
+$optInfo = 1 if !($optInfo | $optLinks | $optLids | $optErrs);
+
+
+my %tagIDs;	# @{$tagIDs{'Link'}} is an array of all the Link ids. Also contains Node, SM.
+my $path;
+my %db;
+my @EnumSMstates = qw(Inactive Discovering Standby Master);
+
+
+while(<>) {
+	chomp;
+	my $line = $_;
+	if($line =~ /<(\w+).*>(.+)<\/.+>/) {
+		## This is a value, eg <NodeGUID>0x00066a00eb002738</NodeGUID>
+		my $tag = $1;
+		my $val = $2;
+		# print "$path/$tag = $val\n";
+		# Store in %db, only if we are interested in the value
+		if( ($path =~ /\/Snapshot\/(Links|SMs|PortCounters)/) ||
+				($tag =~ /(LID|NodeGUID|NodeDesc|NodeType_Int|Active)/) ||
+				($path =~ /PortCounters/) ) {
+			if($tag eq 'NodeType_Int') {
+				$val = $val eq '2' ? 'SW' : 'CA';
+			}
+			$db{"$path/$tag"} = $val;
+		}
+	} elsif($line =~ /<\/(\w+)/) {
+		## This is an end tag, eg </Node>
+		# print "Close ". $1. "\n";
+		my $tag = $1;
+		$path =~ s|&[^/]+$||;	# strip the id off, if present
+		$path =~ s|/$tag$||;	# strip the last tag off
+	} elsif($line =~ /<(\w+)/) {
+		## This is a start tag, eg <Node id="0x00066a00eb002738">
+		# print "Open ". $1. "\n";
+		my $tag = $1;
+		if($line =~ / id="(.*)">/) {
+			my $id = $1;
+			$path .= "/$tag&$id";
+			push @{$tagIDs{$tag}}, $id;
+		} else {
+			$path .= "/$tag";
+		}
+	}
+	# print "Path $path\n";
+}
+
+if($optLinks) {
+    # iba_extract_sel_links
+    foreach my $link (@{$tagIDs{'Link'}}) {
+	# /Snapshot/Links/Link&0x00066a00ec002826:16/From/PortNum = 16
+	# /Snapshot/Nodes/Node&0x00066a00eb002738/NodeDesc = TSG180 S203B
+	my $linkText = '';
+	foreach my $end (qw(From To)) {
+		my $guid = $db{"/Snapshot/Links/Link&$link/$end/NodeGUID"};
+		my $port = $db{"/Snapshot/Links/Link&$link/$end/PortNum"};
+		# my $type = $db{"/Snapshot/Nodes/Node&$guid/NodeType_Int"} eq '2' ? 'SW' : 'CA';
+		my $type = $db{"/Snapshot/Nodes/Node&$guid/NodeType_Int"};
+		my $desc = $db{"/Snapshot/Nodes/Node&$guid/NodeDesc"};
+		$linkText .= "$guid;$port;$type;$desc";
+		$linkText .= ';' if $end eq 'From';
+	}
+	print $linkText. "\n";
+    }
+}
+
+if($optErrs) {
+    # iba_report -o errors
+
+	my %portCounters;
+
+	my $hasCounters = 0;
+	foreach my $counter (grep /Snapshot.Nodes.*.PortCounters/, (keys %db) ) {
+		$hasCounters = 1;
+		$counter =~ m#(.*)/(\w+)#;
+		my $path = $1; my $tag = $2;
+		if( ($tag !~ /Data|Pkts/) && ($db{$counter} > 0) ) {
+			$portCounters{$path} .= "$tag,";
+		}
+	}
+	if(!$hasCounters) {
+		print "This snapshot was not created with the -s option, cannot show errors.\n";
+		exit 1;
+	}
+
+    my $nLinks = 0;
+    my $nErrLinks = 0;
+    foreach my $link (@{$tagIDs{'Link'}}) {
+	# /Snapshot/Links/Link&0x00066a00ec002826:16/From/PortNum = 16
+	# /Snapshot/Nodes/Node&0x00066a00eb002738/NodeDesc = TSG180 S203B
+	# /Snapshot/Nodes/Node&0x00066a00e3007163/PortInfo&0x00066a00e3007163:7/PortCounters/SymbolErrorCounter = 0
+	my $linkText = '';
+	my $hasError = 0;
+	foreach my $end (qw(From To)) {
+		my $guid = $db{"/Snapshot/Links/Link&$link/$end/NodeGUID"};
+		my $port = $db{"/Snapshot/Links/Link&$link/$end/PortNum"};
+		# my $type = $db{"/Snapshot/Nodes/Node&$guid/NodeType_Int"} eq '2' ? 'SW' : 'CA';
+		my $type = $db{"/Snapshot/Nodes/Node&$guid/NodeType_Int"};
+		my $desc = $db{"/Snapshot/Nodes/Node&$guid/NodeDesc"};
+		if($end eq 'From') {
+			my $mtu   = $db{"/Snapshot/Nodes/Node&$guid/PortInfo&$guid:$port/MTUActive"};
+			my $speed = $db{"/Snapshot/Nodes/Node&$guid/PortInfo&$guid:$port/LinkSpeedActive_Int"};
+			my $width = $db{"/Snapshot/Nodes/Node&$guid/PortInfo&$guid:$port/LinkWidthActive_Int"};
+			$speed = (0, 2.5, 5, 0, 10)[$speed];
+			$width = (0,   1, 4, 0,  8)[$width];
+			my $rate = $speed * $width;
+			$linkText .= sprintf("%3dg $mtu $guid  %2d $type $desc\n", $rate, $port);
+		} else {
+			$linkText .= sprintf("<->       $guid  %2d $type $desc\n", $port);
+		}
+		if(exists $portCounters{"/Snapshot/Nodes/Node&$guid/PortInfo&$guid:$port/PortCounters"} ) {
+		    $hasError = 1;
+		    foreach my $counter
+				(split ',', $portCounters{"/Snapshot/Nodes/Node&$guid/PortInfo&$guid:$port/PortCounters"}) {
+			my $err  = $db{"/Snapshot/Nodes/Node&$guid/PortInfo&$guid:$port/PortCounters/$counter"};
+			$linkText .= "    $counter: $err Exceeds Threshold: 1\n";
+		    }
+		}
+	}
+	if($hasError) {
+		$nErrLinks++;
+		print $linkText. "\n";
+	}
+	$nLinks++;
+    }
+	print "$nLinks of $nLinks Links Checked, $nErrLinks Errors found\n";
+	print "-------------------------------------------------------------------------------\n";
+
+}
+
+
+if($optLids) {
+    # iba_extract_lids
+    foreach my $node (@{$tagIDs{'Node'}}) {
+		# /Snapshot/Nodes/Node&0x00066a00e3005951/NodeGUID = 0x00066a00e3005951
+		# /Snapshot/Nodes/Node&0x00066a00e3005951/PortInfo&0x00066a00e3005951:0/LID = 0x008c
+		
+		my $guid = $db{"/Snapshot/Nodes/Node&$node/NodeGUID"};
+		my $desc = $db{"/Snapshot/Nodes/Node&$node/NodeDesc"};
+		my $type = $db{"/Snapshot/Nodes/Node&$node/NodeType_Int"};
+		my $p = $type eq 'SW' ? 0 : 1;
+		my $lid  = $db{"/Snapshot/Nodes/Node&$node/PortInfo&$node:$p/LID"};
+		print "$guid;$p;$type;$desc;$lid\n";
+    }
+}
+
+
+if($optInfo) {
+	# fabric_info
+    foreach my $node (@{$tagIDs{'SM'}}) {
+		# /Snapshot/SMs/SM&0x001175000079c09c:1/PortGUID = 0x001175000079c09c
+		# /Snapshot/SMs/SM&0x001175000079c09c:1/State_Int = 3
+		my $guid = $db{"/Snapshot/SMs/SM&$node/PortGUID"};
+		my $state= $db{"/Snapshot/SMs/SM&$node/State_Int"};
+		my $desc = $db{"/Snapshot/Nodes/Node&$guid/NodeDesc"};
+		print "SM: $desc Guid: $guid State: $EnumSMstates[$state]\n";
+    }
+	my $nCAs = 0;
+	my $nSWs = 0;
+	my $nLinks = scalar(@{$tagIDs{'Link'}});
+    foreach my $node (@{$tagIDs{'Node'}}) {
+	if($db{"/Snapshot/Nodes/Node&$node/NodeType_Int"} eq 'SW') {
+		$nSWs++;
+	} else {
+		$nCAs++;
+	}
+    }
+    print "Number of CA Ports: $nCAs\n";
+    print "Number of Switch Chips: $nSWs\n";
+    print "Number of Links: $nLinks\n";
+}
+
+
+exit 0;
+
+
+
+
+
+#############################################################################
+##
+##
+## Previous code using XML::LibXML
+##
+##
+
+
+=cut
+
+Purpose: emulates iba_extract_sel_links -X snapshot.xml
+So that you can examine a snapshot on a machine without IFS installed.
+
+Based on this example:
+http://www.perlmonks.org/?node_id=490846
+
+The findnode() function has some performance issues in RHEL5:
+http://www.perlmonks.org/?node_id=1029432
+Hence some of my workarounds.
+
+[andru@hfc03 2014]$ time ./xml2.pl plcw_snap_20140916.xml
+real    18m36.381s
+user    18m34.521s
+sys     0m0.462s
+[andru@hfc03 2014]$ wc plcw_snap_20140916.xml
+  479093   496329 16656612 plcw_snap_20140916.xml
+[andru@hfc03 2014]$ grep '<Link ' plcw_snap_20140916.xml | wc -l
+4190
+[andru@hfc03 2014]$
+
+# yum install perl-XML-LibXML-Common.x86_64 # may be unnecessary
+# yum install perl-XML-LibXML.x86_64 # Required
+
+=cut
+
+
+=cut
+
+my $filename = $ARGV[0];
+use XML::LibXML;
+
+my $parser = XML::LibXML->new();
+my $doc    = $parser->parse_file($filename);
+
+	# $guid = $guid->to_literal;  ???
+
+my %nodeDescs;
+my %nodeTypes;
+if(1) {
+    foreach my $node ($doc->findnodes('/Snapshot/Nodes/Node')) {
+	# my $guid = $node->findnodes('./NodeGUID');
+	# my $desc = $node->findnodes('./NodeDesc');
+	# my $type = ($node->findnodes('./NodeType_Int'))->to_literal;
+	my $guid = ($node->getChildrenByTagName('NodeGUID'))->to_literal;
+	my $desc = ($node->getChildrenByTagName('NodeDesc'))->to_literal;
+	my $type = ($node->getChildrenByTagName('NodeType_Int'))->to_literal;
+	$nodeDescs{$guid} = $desc;
+	$nodeTypes{$guid} = ($type eq '2') ? 'SW' : 'CA';
+    }
+}
+
+if(1) {
+    foreach my $link ($doc->findnodes('/Snapshot/Links/Link')) {
+	my $linkText = '';
+	foreach my $end (qw(From To)) {
+		# my $guid = ($link->getChildrenByTagName("$end"));
+		# print "$end .$link. .$guid.\n";
+		# $linkText .= ($link->findnodes('./From/NodeGUID'))->to_literal. ';';
+		my $guid = $link->findnodes("./$end/NodeGUID");
+		my $port = $link->findnodes("./$end/PortNum");
+		# my $endx = $link->findnodes("./$end");
+		# my $guid = ($endx->getChildrenByTagName('NodeGUID'))->to_literal;
+		# my $port = ($endx->getChildrenByTagName('PortNum'))->to_literal;
+		$linkText .= "$guid;$port;$nodeTypes{$guid};$nodeDescs{$guid};"
+	}
+	$linkText =~ s/;$//;
+	print $linkText. "\n";
+    }
+}
+=cut

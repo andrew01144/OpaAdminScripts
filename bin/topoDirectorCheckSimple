@@ -1,0 +1,10 @@
+#!/bin/bash
+
+opaextractsellinks -Qq $@ | grep ' S[12]' > internalLinks.txt
+IFS=$'\n'
+for leaf in $(opaextractlids -Qq $@ |cut -d \; -f 4 | grep ' L[12]')
+do
+        echo $leaf $(grep -c $leaf internalLinks.txt)
+done
+unset IFS
+

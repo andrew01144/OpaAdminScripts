@@ -1,0 +1,69 @@
+#!/bin/sh
+
+# This script converts text files to xml, for use as topology files (-T) in iba_report
+# Uncomment and tweak the part you want to use
+
+
+echo '<?xml version="1.0" encoding="utf-8" ?>'
+
+
+# ###### Topology - Link Records ######
+# Create cable maps so that iba_report -o verifylinks can check the fabric against your design.
+# Tweak this to match your input records, if you use NodeGUID or NodeDesc to identify the switches.
+# You can add additional info in CableDetails
+
+# Input (NodeDesc/NodeDesc):
+# IBedge01;1;IBcore01 L101;1
+# IBedge01;2;IBcore01 L101;10
+# IBedge01;3;IBcore01 L101;2
+
+# Input (NodeGUID/NodeDesc):
+# 0x00066a100600025a;1;IBcore01 L101;1
+# 0x00066a100600025a;2;IBcore01 L101;10
+# 0x00066a100600025a;3;IBcore01 L101;2
+
+# Input with CableDetails:
+# IBedge01;17;plcgsm1 HCA-1;1;Bay01
+# IBedge01;18;plcg001 HCA-1;1;Bay02
+# IBedge01;19;plcg002 HCA-1;1;Bay03
+
+echo '<Topology><LinkSummary>'
+opaxmlgenerate -X $1 -h Link -h Port -g NodeDesc -g PortNum -e Port -h Port -g NodeDesc -g PortNum -e Port -e Link
+# xml_generate -X $1 -h Link -h Port -g NodeGUID -g PortNum -e Port -h Port -g NodeDesc -g PortNum -e Port -h Cable -g CableDetails  -e Cable -e Link
+echo '</LinkSummary></Topology>'
+
+
+
+
+
+
+# ###### CableDetails - single-ended ######
+# Associates CableDetails with a Port
+# EG: to add a cable serial number to an error report
+# Interesting: it shows that a link record only needs one end
+
+# Input:
+# 0x00066a00ec0029f6;01;C22CMRV
+# 0x00066a00ec0029f6;02;C22CMCJ
+# 0x00066a00ec0029f6;03;C22CN51
+
+# echo '<Topology><LinkSummary>'
+# xml_generate -X $1 -h Link -h Port -g NodeGUID -g PortNum -e Port -h Cable -g CableDetails -e Cable -e Link
+# echo '</LinkSummary></Topology>'
+
+
+
+
+
+
+# ###### NodeDetails ######
+# Associates NodeDetails with a node
+# This is the closest thing we have to map GUID to names
+# Input:
+# 0x00066a100600025a;IBedge01
+# 0x0002c9020040c720;IBedge02
+# 0x0002c9020040c723;IBedge03
+
+# echo '<Topology><Nodes><Switches>'
+# xml_generate -X $1 -h Node -g NodeGUID -g NodeDetails -e Node
+# echo '</Switches></Nodes></Topology>'

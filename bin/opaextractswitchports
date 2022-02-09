@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# Get port state, cable info and neighbor for each port
+
+# Usage: opaextractswitchports [opareport options]
+
+# Example: List suspicous ports. Ports that are Not-Active and Not-Offline should probably be Active.
+# opaextractswitchports -Qq | grep -v ';Active;' | grep -v ';Offline;'
+
+# Example: How many different states are my ports in? (includes port 0, so total should be a multiple of 49)
+# opaextractswitchports -Qq | cut -d \; -f 6,7 | sort | uniq -c
+
+
+opareport -o comps -d 5 -A -F nodetype:SW -x $@ | opaxmlextract -H -d \; -s Focus \
+	-e Node.NodeGUID -e PortInfo.PortNum -e Node.NodeType -e Node.NodeDesc -e Node.LID \
+	-e PortState -e PhysState -e OfflineDisabledReason -e Length -e VendorName -e VendorPN -e VendorSN \
+	-e PortInfo.Neighbor.Port.NodeDesc \
+	-s SMs | perl -F\; -lane 'if($F[12]){$nbr=$F[12]}else{print $_.$nbr;$nbr=""}'
+
+
+
+# Normally, we supress the Neighbor (-s Neighbor).
+# We need the Neighbor here, but it causes opaxmlextract to print an additional line when the Neighbor is present.
+# The perl one-liner combines the lines (it assumes the Neighbor line comes first).
+
+# The perl one-liner converts this...
+# 0x0011750102536c5f;27;SW;switchOPA;;;;;;;;lnet2 hfi1_0
+# 0x0011750102536c5f;27;SW;switchOPA;Active;LinkUp;;2;TE Connectivity;2821076-2;15190482;
+# 0x0011750102536c5f;28;SW;switchOPA;Down;Offline;No Loc Media;;;;;
+# 0x0011750102536c5f;29;SW;switchOPA;;;;;;;;bw-2-08 hfi1_0
+# 0x0011750102536c5f;29;SW;switchOPA;Active;LinkUp;;2;Hitachi Metals;IQSFP26C-20;025600582;
+
+# ... to this. Note port 28 is down, so has no Neighbor, and only one line in the original report.
+# 0x0011750102536c5f;27;SW;switchOPA;Active;LinkUp;;2;TE Connectivity;2821076-2;15190482;lnet2 hfi1_0
+# 0x0011750102536c5f;28;SW;switchOPA;Down;Offline;No Loc Media;;;;;
+# 0x0011750102536c5f;29;SW;switchOPA;Active;LinkUp;;2;Hitachi Metals;IQSFP26C-20;025600582;bw-2-08 hfi1_0
+
+

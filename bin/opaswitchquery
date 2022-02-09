@@ -1,0 +1,625 @@
+#!/usr/bin/perl
+use strict;
+
+# 2016-02-26
+
+sub usage {
+	my $usageText = qq@Usage: opaswitchquery [-ports h:p] [-N node1,node2] [-L nodefile]
+        [-xedge] [-qFile [filename]] [hwCheck|config|vpd]
+
+   -N       List of switch GUIDs
+   -L       File of switch GUIDs, defaults to /etc/opa/switches
+   -xedge   Operate on True Scale switches
+   -qFile   Report from data in previous scan
+
+Types of report
+   hwCheck  (Default) Physical state: PSUs, Fans, Temperatures
+   config   Show configurable parameters
+   vpd      Vendor Product Data: Model, Serial Number, etc
+
+Examples
+   opaswitchquery -L mynodelist hwCheck
+   opaswitchquery -N 0x00117501026a5684,0x00117501026a5685 vpd
+   opaswitchquery -ports 3:1 config
+@;
+
+	my $temperatureText = qq@
+Temperature sensor names for Internally and Externally Managed 48p switches
+ Int           Ext          Description
+ ASIC_INT      PRR_ASIC     The ASIC measures and reports its own temperature.
+ n/a           LTC2974      A temperature sensor on the base board of the switch.
+ CPU_CORE      n/a          The q7 management board measures and reports its own temperature.
+ QSFP_MAX      MAX_QSFP     From bytes 22&23 of the QSFP data block. Reports the max of all the QSFPs.
+ ASIC_EXT      n/a          A thermal diode in the ASIC is measured and reported by circuitry outside the ASIC.
+Equivalence
+ ASIC_INT      PRR_ASIC     Exactly equivalent.
+ CPU_CORE      LTC2974      Roughly equivalent.
+ QSFP_MAX      MAX_QSFP     Exactly equivalent.
+ ASIC_EXT      n/a          No equivalent.
+
+ QSFP_MAX: If all the cables are Copper, the Int switch reports 'N/A', the Ext switch reports '20N'.
+@;
+	warn $usageText;
+	warn $temperatureText;
+	exit 1;
+}
+
+# Speed: 50 switches in 3 seconds
+# Testing: ./opaswitchquery -N 0x00117501026a5683,0x00117501026a5684,0x00117501026a5685,0x00117501026a9901 -testfile=testdata
+
+my $dataLogFile = '/tmp/opaswitchquery';	# For -qFile option
+
+##################
+#
+# Temperature thresholds
+#
+
+my %tempThresholds = (
+	'TempEnclosr' => { 'Warning' => 90, 'Critical' => 105 },
+	'TempAsicInt' => { 'Warning' => 94, 'Critical' => 104 },
+	'TempMaxQSFP' => { 'Warning' => 70, 'Critical' => 100 },
+);
+my $dummy = '
+
+	# These values are taken from "hwCheck 1" on a managed 48p switch.
+        Temperature      Warning        Critical        Actual
+        ASIC_EXT             90C            105C           51C
+        ASIC_INT             94C            104C           57C
+        QSFP_MAX             70C            100C           N/A
+        CPU_CORE             90C            100C           29C
+';
+#
+##################
+
+
+
+# To do:
+
+# Think about all failure modes
+#	opaswquery timeout
+#	opaswquery unexpected response
+#	interpretting a block of responses that include both successful and unsuccessful responses
+# add a ping option
+# change $attrib{$index} to $attrib[$index]  (it started as $attrib{$guid})
+
+
+# sort by NodeDesc? No, it *should* list the switches in the order requested
+#	User can pipe through sort -k 2, though it will mess up headers and footers
+#	Or user can collect a sorted list of GUIDs: opaextractlids -F nodetype:SW | sort -t \; -k 4 | cut -d \; -f 1
+
+# True Scale / Xedge compatibility:
+#	hwCheck - OK, VPD - OK, Config - needs tweaking
+
+# Test
+#	on a single PSU model. Can vpd tell me anything? I don't think so.
+#		from vpd: 100SWE48QF
+#		full pn:  100SWE48UF2	Q/U is managed/unmanaged; 1/2 is PSUs; F/R is fwd/rev
+#	how to read fan direction?
+
+# How it works (out of date)
+# Main - calls doQuery() for every type of query that opaswquery (or xedge_query) supports,
+#	even if we don't need all the data. Accumulates the responses for an individual switch in @data.
+# Then calls extractData(), which scans the text in @data, and populates attribs{$index}{attribName}.
+# The calls printLine() to print the required set of sttributes from attribs{$index}.
+# Notes
+# 1)	Attribs{$index} holds data for all the switches we have queried, though currently
+#	we doQuery(), extractData(), printLine() one switch at a time.
+#	We do it one switch at a time so that you can see the progress trough the switches.
+# 2)	extractData() handles both OPA and Xedge; there is no conditional code dependent on $optXedge.
+
+
+use Getopt::Long;
+
+my $optN;
+my $optL;
+my $optOutType;
+my $optXedge;
+my $optTestFile;
+my $optPorts;
+my $optQueryFile;
+my $optNoTemperature;
+my $optHelp;
+GetOptions(
+	'N:s' => \$optN,
+	'L:s' => \$optL,
+	'o:s' => \$optOutType,		# more likely, use last arg on line
+	'ports:s' => \$optPorts,
+	'xedge' => \$optXedge,
+	'testFile:s' => \$optTestFile,
+	'qFile:s' => \$optQueryFile,
+	'NoTemperature' => \$optNoTemperature,	# Getting the temperature might be slow, so allow a disable
+	'help' => \$optHelp,
+) or usage();
+usage() if $optHelp;
+
+if($ARGV[0]) {
+	$optOutType = $ARGV[0];		# list arg on line
+}
+
+$optOutType = lc $optOutType;
+$optOutType = 'hwcheck' if !$optOutType;
+if($optOutType ne 'hwcheck' && $optOutType ne 'config' && $optOutType ne 'vpd') {
+	warn "Invlaid report type '$optOutType'\n";
+	usage();
+	exit 1;
+}
+$optQueryFile = $dataLogFile if defined $optQueryFile && !$optQueryFile;
+
+my @guidList;
+my %nodeDescFromFile;
+my $portsArg = '';
+my @data;
+my @dataLog;
+my %attrib;
+my $query;
+my $index=0;
+my $hasTemperature = 0;   # opaswquery in IntelOPA .625 does not have -Q 6 for temperature
+
+$hasTemperature = 1 if $optTestFile;
+
+
+if(!$optQueryFile) {
+    # Skip all this stuff if reading @dataLog from a file
+
+    {
+	$optPorts = $ENV{'PORTS'} if !$optPorts;
+	if($optPorts) {
+		if($optPorts =~ /^([0-9]):([0-9])$/) {
+			$portsArg .= "-h $1 " if $1;
+			$portsArg .= "-p $2 " if $2;
+		} else {
+			warn "Invalid -port format '$optPorts'.\n";
+			exit 1;
+		}
+	}
+    }
+
+
+    # Make the list of guids to query
+    if($optN) {
+	# GUIDs from command line: Extract all the hex numbers from $guidListTxt
+	$_ = $optN;
+	while( s/\b(0x[0-9A-Fa-f]+)\b// ) {
+		push @guidList, $1;
+	}
+    } else {
+	# GUIDs from file
+	if(!$optL) {
+		$optL = '/etc/opa/switches';
+		$optL = '/etc/sysconfig/iba/ibnodes' if $optXedge;
+	}
+	open my $fh, $optL or die "Cannot open $optL";
+	while(<$fh>) {
+		# 0x001175010262ed00
+		# 0x001175010262ed00,OmniPth00117501ff62ed00
+		# 0x001175010262ed00:0:0,OmniPth00117501ff62ed00,2
+		s/#.*//;
+		     if(/\b(0x[0-9A-Fa-f]+)\b.*?,(\w+)/) {
+			push @guidList, $1;
+			$nodeDescFromFile{$1} = $2;
+		} elsif(/\b(0x[0-9A-Fa-f]+)\b/) {
+			push @guidList, $1;
+		}
+	}
+	close $fh;
+    }
+
+
+    if(!$optTestFile) {
+	# If running on a real fabric:
+	#     Test for ability to execute opaswquery or xedge_query
+	#     Check if this version of xedge_query supports -Q 6 (temperature)
+
+	# my $oToolsPath = '/opt/opa/tools';
+	my $oToolsPath = '/usr/lib/opa/tools';
+	my $xToolsPath = '/opt/iba/ib_tools';
+	my $cmd = "PATH=\$PATH:$oToolsPath opaswquery  $portsArg -rubbish 2>&1;";
+	$cmd   .= "PATH=\$PATH:$xToolsPath xedge_query $portsArg -rubbish 2>&1";
+	my @response;
+	open my $fh, "$cmd |" || die;
+	my @response = (<$fh>);
+	close $fh;
+	push @dataLog, $cmd;
+	push @dataLog, @response;
+	my $hasOpaQuery   = scalar grep /usage: opaswquery/,  @response;
+	my $hasXedgeQuery = scalar grep /usage: xedge_query/, @response;
+	if(!$optXedge) {
+		if($hasOpaQuery) {
+			; # opa, ok
+		} else {
+			if($hasXedgeQuery) {
+				$optXedge = 1; # Auto select Xedge
+			} else {
+				warn "Could not execute opaswquery\n";
+				exit 1;
+			}
+		}
+	} else {
+		if($hasXedgeQuery) {
+			; # xedge, ok
+		} else {
+				warn "Could not execute xedge_query\n";
+				exit 1;
+		}
+	}
+	$query = !$optXedge ?
+			"PATH=\$PATH:$oToolsPath opaswquery $portsArg" :
+			"PATH=\$PATH:$xToolsPath xedge_query $portsArg";
+	$hasTemperature = scalar grep /temperature/i, @response;	# Look for Temperature in the help text
+    }
+
+}
+
+
+sub doQuery {
+	my $index = shift;
+	my $guid = shift;
+        my $q = shift;	# Query.Subquery (-Q query -i subquery)
+        my $i = 0;
+        if($q =~ /(\d+)\.(\d)/) { # If there is a subquery
+                $q = $1; $i = $2;
+        }
+
+	$q .= " -i $i" if $i > 0;
+	my $cmd = "$query -t $guid -Q $q 2>&1";
+	open my $fh, "$cmd |" || die;
+	my @response = (<$fh>);
+	close $fh;
+	push @dataLog, $cmd;
+	push @dataLog, @response;
+
+	return $response[$#response] =~ /completed/ ? 1 : 0;	# Sucessful?
+	# What about a timeout? How to detect it? How to invoke it for testing?
+}
+
+sub extractData {
+  my $index = shift;
+
+	# extract the responses for this index
+	@data = ();
+	foreach (@dataLog) {
+		push @data, $_ if (/^START $index/../^END/);
+	}
+	$data[0] =~ m/^START\s+\d+\s+(\w+),(.*)$/;
+	$attrib{$index}{GUID} = $1;
+	$attrib{$index}{NodeDesc0} = "$2";
+
+	if(!grep /(opasw|xedge_)query completed/, @data) {
+		if(grep /No Path Records/, @data) {
+			$attrib{$index}{QueryError} = 'is not in the fabric';
+		} elsif(grep /Invalid MAD/, @data) {
+			$attrib{$index}{QueryError} = 'is not a switch';
+		} elsif(grep /status is 11/, @data) {
+			$attrib{$index}{QueryError} = 'is not an externally managed switch';
+		} else {
+			$attrib{$index}{QueryError} = 'bad response';
+		}
+		return 0;
+	}
+
+  foreach (@data) {
+	my $n = '';
+	my $v = '';
+	chomp;
+	tr /\r//d;
+
+	   if(/from (\w+) firmware/)          { $n = 'BootImage'; $v = $1 }	# -Q 2
+	elsif(/FW Version is (.*)/)           { $n = 'fwVersion'; $v = $1 }	# -Q 3
+	elsif(/VPD (.*)/)                     { $n = 'VPD';       $v = $1 }	# -Q 4
+	elsif(/Node description is (.*)/)     { $n = 'NodeDesc1'; $v = $1 }	# -Q 5  also opareport
+	elsif(/Session ID: (.*)/)             { $n = 'SessionID'; $v = $1 }	# -Q 10
+	elsif(/Link Width\s*:\s+(.*)/)        { $n = 'LnkWdth';   $v = $1 }	# -Q 11 also opareport
+	elsif(/Link Speed\s*:\s+(.*)/)        { $n = 'LnkSpd';    $v = $1 }	# -Q 11 also opareport
+	elsif(/FM Enabled\s*:\s+(.*)/)        { $n = 'FM_Enbl';   $v = $1 }	# -Q 11 also opareport
+	elsif(/vCU\s*:\s+(.*)/)               { $n = 'vCU';       $v = $1 }	# -Q 11 also opareport?
+	elsif(/External Loopback.*:\s+(.*)/)  { $n = 'ExtLoop';   $v = $1 }	# -Q 11
+	elsif(/Node Description\s*:\s+(.*)/)  { $n = 'NodeDesc2'; $v = $1 }	# -Q 11
+	elsif(/BoardID: (.*)/)                { $n = 'BoardID';   $v = $1 }	# -Q 12
+
+	elsif(/Link CRC Mode\s*:\s+(.*)/)     { $n = 'CRCmode';   $v = $1; $v =~ s/-bit//g }	# -Q 11 also opareport
+
+	elsif(/SENSOR .*: (\d+)C.*: (\d+)C.*: (\d+)C/) {			# -Q 6
+		# SENSOR 0: LTC2974: 33C SENSOR 1: MAX QSFP: 20C SENSOR 2: PRR ASIC: 20C
+		# MAX QSFP and PRR ASIC are around the wrong way in IntelOPA 10.0.0.0.697
+		$attrib{$index}{TempEnclosr} = $1;
+		$attrib{$index}{TempAsicInt} = $2;
+		$attrib{$index}{TempMaxQSFP} = $3;
+	}
+	elsif(0 && /FAN/) {							# -Q 7
+		while( s/FAN (.):(\w+)// ) {	# OPA only
+			$attrib{$index}{Fans}[$1] = substr($2, 0, 1);
+		}
+	}
+	elsif(/FAN/) {								# -Q 7
+		# FAN 0:NORMAL FAN 1:NORMAL FAN 2:SLOW FAN 3:NORMAL FAN 4:FAST FAN 5:NORMAL
+		# [Xedge: FAN 1/0:SLOW FAN 1/1:SLOW]
+		# strings /opt/opa/tools/opaswquery | grep FAN >> FAN %d:FAST; FAN %d:SLOW; FAN %d:NORMAL
+		# Consume each fan until line is exhausted
+		while( s#FAN ([\d/]+):(\w+)## ) {
+			my $n = $1;
+			my $v = substr($2, 0, 1);
+			if($n =~ m#(\d)/(\d)#) {	# Xedge tray = $1, fan = $2
+				$n = ($1-1)*2 + $2;	# Tray/Fan: 1/0, 1/1, 2/0, 2/1 >>> 0, 1, 2, 3
+				$attrib{$index}{Fans}[4] = $attrib{$index}{Fans}[5] = '-';
+			}
+			$attrib{$index}{Fans}[$n] = $v;
+		}
+	}
+	elsif(/PS (.): (\w+)/) {						# -Q 8
+		# PS 1: ONLINE
+		# strings /opt/opa/tools/opaswquery | grep PS  >> PS %d: ONLINE;PS %d: OFFLINE
+		# strings /opt/iba/ib_tools/xedge_query | grep PS >> PS %d: ENGAGED; PS %d: FAILED
+
+		$v = ' ';
+		$v = 'U' if $2 eq 'ONLINE' || $2 eq 'ENGAGED';
+		$v = 'D' if $2 eq 'OFFLINE' || $2 eq 'FAILED';
+		$attrib{$index}{PSUs}[$1] = $v;
+	}
+	if($n) {
+		$attrib{$index}{$n} = $v;
+	}
+  }
+  {
+	# Summarize psusAndFans
+	my $s = '';
+	foreach my $i (1, 2) {
+		$s .= $attrib{$index}{PSUs}[$i];
+	}
+	foreach my $i (0..5) {
+		$s .= $attrib{$index}{Fans}[$i];
+	}
+	$attrib{$index}{psusAndFans} = $s;
+  }
+  {
+	# Apply warnings and criticals to temperatures
+	foreach my $sensor (grep /^Temp/, keys %{$attrib{$index}}) {
+		if($attrib{$index}{$sensor} >= $tempThresholds{$sensor}{Critical}) {
+			$attrib{$index}{"$sensor-status"} = 'C';
+		} elsif($attrib{$index}{$sensor} >= $tempThresholds{$sensor}{Warning}) {
+			$attrib{$index}{"$sensor-status"} = 'W';
+		} else {
+			$attrib{$index}{"$sensor-status"} = 'N';
+		}
+	}
+  }
+  {
+	# Set status
+	my %sum = ();
+	foreach my $psu (1, 2) {
+		$sum{'psuD'}++ if $attrib{$index}{PSUs}[$psu] eq 'D';
+	}
+	foreach my $fan (0..5) {
+		$sum{'fanS'}++ if $attrib{$index}{Fans}[$fan] eq 'S';
+		$sum{'fanF'}++ if $attrib{$index}{Fans}[$fan] eq 'F';
+	}
+	foreach my $sensor (grep /^Temp/, keys %{$attrib{$index}}) {
+		$sum{'TempW'}++ if $attrib{$index}{"$sensor-status"} eq 'W';
+		$sum{'TempC'}++ if $attrib{$index}{"$sensor-status"} eq 'C';
+	}
+	# warn ">>>> index:$index, psuD:$sum{'psuD'}, fanS:$sum{'fanS'}, fanF:$sum{'fanF'}, TempW:$sum{'TempW'}, TempC:$sum{'TempC'}\n";
+	$attrib{$index}{Status} = 'Good';
+	$attrib{$index}{Status} = 'Warning' if $sum{'psuD'} || $sum{'fanS'} || $sum{'TempW'};
+	$attrib{$index}{Status} = 'Critical' if ($sum{'fanS'} && $sum{'fanS'} >3) || $sum{'TempC'};
+  }
+  {
+	# Extract indiviual fields from the VPD string
+	# VPD USFU38150006B,H89344-003-01,100SWE48QF,003-01,Intel Corporation,100 OP Edge 48p Managed Forward ,001175,9-17-2015,10:00
+	my @vpdNames = qw(SerialNum PartNum Model HwVersion Manfr ProdDesc MfgID MfgDate MfgTime);
+	my @a = split ',', $attrib{$index}{VPD};
+	foreach (@vpdNames) {
+		$attrib{$index}{'vpd'. $_} = shift @a;
+	}
+  }
+  {
+	# Make some useful NodeDescs
+	# NodeDescA - best for identifying a switch in a report. Use name on file if available, else use the configured name.
+	$attrib{$index}{NodeDescA} = $attrib{$index}{NodeDesc0} ? $attrib{$index}{NodeDesc0} : $attrib{$index}{NodeDesc2};
+	# NodeDescB - For getconfig - does the configured name match the name of file?
+	if($attrib{$index}{NodeDesc0} && $attrib{$index}{NodeDesc0} eq $attrib{$index}{NodeDesc2}) {
+		$attrib{$index}{NodeDescB} = 'match';
+	} else {
+		$attrib{$index}{NodeDescB} = $attrib{$index}{NodeDesc2};
+	}
+  }
+}
+
+# What opaswitchadmin can report:
+# opaswitchadmin info      = fwVersion, VPD/HwVersion, VPD/PartNum, FANs, PSUs
+# opaswitchadmin getconfig = LnkWdth LnkSpd FM_Enbl CRCmode vCU ExtLoop NodeDesc2
+# opaswitchadmin hwvpd     = VPD
+
+# All the data items this has collected:
+# GUID NodeDesc0
+# BootImage fwVersion VPD NodeDesc1 SessionID
+# LnkWdth LnkSpd FM_Enbl CRCmode vCU ExtLoop NodeDesc2
+# BoardID TempEnclosr TempMaxQSFP TempAsicInt psusAndFans
+# vpdSerialNum vpdPartNum vpdModel vpdHwVersion vpdManfr vpdProdDesc vpdMfgID vpdMfgDate vpdMfgTime
+
+##################
+
+
+
+sub printLine {
+    my $index = shift;
+    my $opType = shift;
+
+    my $head1 = sprintf('%-18s %-26s', 'GUID', 'NodeDesc');
+	my $nodeDesc;
+
+	if($attrib{$index} && $attrib{$index}{QueryError}) {
+		print "$attrib{$index}{GUID}: $attrib{$index}{QueryError}\n";
+		return;
+	}
+
+    if($opType eq 'hwcheck') {
+	# Hardware health (PSUs, Fans and Temperatures)
+	if($index eq 'header') {
+	   my($header2, $header3);
+	   if(!$optXedge) {
+		$header2 = '         | PSUs      | Fans        ';
+		$header3 = 'Health   |  1    2   | 0 1 2 3 4 5 ';
+		if($hasTemperature) {
+			$header2 .= '| Temperatures  ';
+			$header3 .= '| Chip Encl QSFP';
+		}
+	   } else {
+		$header2 = '         | PSUs      | Fans    ';
+		$header3 = 'Health   |  1    2   | 0 1 2 3 ';
+	   }
+		print "                                              $header2\n";
+		print "$head1 $header3\n";
+	} elsif($index eq 'footer') {
+		my $legend = "Legend:\n";
+		$legend .= "  Fan Speeds: N/S/F = Normal/Slow/Fast\n";
+		$legend .= "  Temperature (Celcius) Status: N/W/C = Normal/Warning/Critical\n" if $hasTemperature;
+		$legend .= "  Temperature Locations: Chip/Encl/QSFP = PRR_ASIC/LTC2974/QSFP_MAX\n" if $hasTemperature;
+		print $legend;
+	} else {
+		my $o = '';
+		$o .= sprintf('%-8s ', $attrib{$index}{Status});
+		$o .= '| ';
+		foreach my $psu (1, 2) { $o .= ($attrib{$index}{PSUs}[$psu] eq 'U' ? ' Up ' : 'Down'). ' ' }
+		$o .= '| ';
+		my @fs = $optXedge ? (0..3) : (0..5);
+		foreach my $fan (@fs) { $o .= $attrib{$index}{Fans}[$fan]. ' ' }
+	    if($hasTemperature) {
+		$o .= '| ';
+		foreach my $sensor (qw(TempAsicInt TempEnclosr TempMaxQSFP)) {
+			$o .= sprintf('%3d%s ', $attrib{$index}{$sensor}, $attrib{$index}{"$sensor-status"});
+		}
+	    }
+		printf("%-18s %-26s %s\n", $attrib{$index}{GUID}, $attrib{$index}{NodeDescA}, $o);
+	}
+    }
+
+    if($opType eq 'config') {
+	# Software configuration
+	my @configItems = qw(fwVersion LnkWdth LnkSpd FM_Enbl CRCmode vCU ExtLoop NodeDescB);
+	if($index eq 'header') {
+	    printf("$head1 %-16s %-7s %-7s %-7s %-8s %-4s %-7s %s\n", @configItems);
+	} elsif($index eq 'footer') {
+		my %configCount;
+		foreach my $g (keys %attrib) {
+			foreach my $col (@configItems) {
+				$configCount{$col}{$attrib{$g}{$col}}++;
+			}
+		}
+		my @configColData = ();
+		foreach my $col (@configItems) { push @configColData, scalar( keys %{$configCount{$col}}) }
+		printf("%-18s %-26s %-16s %-7s %-7s %-7s %-8s %-4s %-7s %s\n",
+			'', 'Number of values', @configColData);
+	} else {
+		my @configColData = ();
+		foreach my $col (@configItems) { push @configColData, $attrib{$index}{$col} }
+		printf("%-18s %-26s %-16s %-7s %-7s %-7s %-8s %-4s %-7s %s\n",
+			$attrib{$index}{GUID}, $attrib{$index}{NodeDescA}, @configColData);
+	}
+    }
+
+    if($opType eq 'vpd') {
+	# Hardware info
+	# my @vpdNames = qw(Model SerialNum PartNum ProdDesc Manfr HwVersion MfgID MfgDate MfgTime);
+	my @vpdNames = qw(Model SerialNum PartNum HwVersion MfgID MfgDate MfgTime); # To shorten line
+	if($index eq 'header') {
+		my $o = '';
+		foreach my $col (@vpdNames) { $o .= $col. ' '  }
+		print $head1. ' '. $o. "\n";
+	} elsif($index eq 'footer') {
+		;
+	} else {
+		my $o = '';
+		foreach my $col (@vpdNames) { $o .= $attrib{$index}{'vpd'. $col}. ' '  }
+		printf("%-18s %-26s %s\n", $attrib{$index}{GUID}, $attrib{$index}{NodeDescA}, $o);
+	}
+    }
+}
+
+sub printTotals {
+	my %totals;
+	my @indexes = sort keys %attrib;
+	$totals{'nSwitches'} = scalar @indexes;
+	foreach my $i (@indexes) {
+		if($attrib{$i}{QueryError}) {
+			$totals{'Errors'}++;
+		} else {
+			$totals{$attrib{$i}{Status}}++;
+		}
+	}
+	printf("Number of switches queried: %d; Good: %d, Warning: %d, Critical: %d, BadResponse: %d\n",
+		$totals{'nSwitches'}, $totals{'Good'}, $totals{'Warning'}, $totals{'Critical'}, $totals{'Errors'});
+
+}
+
+
+### Main
+
+
+	if(!$optQueryFile) {
+		printLine('header', $optOutType);
+
+		foreach my $guid (@guidList) {
+			$index = $index + 1;	# Not $index++, $index is a string.
+			$index = sprintf('%04d', $index);
+			my $d = $nodeDescFromFile{$guid} ? $nodeDescFromFile{$guid} : '';
+			push @dataLog, "START $index $guid,$d\n";
+			@data = ();
+			if($optTestFile) {
+				my $testdata = $guid;
+				$testdata =~ s/.*(....)$/$optTestFile.$1/;
+				open my $fh, $testdata or print "Can't open $testdata    ";
+				@data = (<$fh>);
+				close $fh;
+				push @dataLog, @data;
+			} else {
+				
+				my @queries;
+				if (0) { # All Queries
+					@queries = (2, 3, 4, 5, 7, 8.1, 8.2, 9, 10, 11, 12);
+					@queries = (1, 2, 3, 4, 5, 7.1, 7.2, 8.1, 8.2, 9, 10, 11, 12) if $optXedge;
+				} else { # Only required Queries
+					@queries = (3, 4, 7, 8.1, 8.2, 11);
+					@queries = (3, 4, 7.1, 7.2, 8.1, 8.2, 11) if $optXedge;
+				}
+				push @queries, 6 if $hasTemperature && !$optNoTemperature;
+				my $q = shift @queries;						# get the first query
+				if( doQuery($index, $guid, $q) ) {
+					foreach (@queries) { doQuery($index, $guid, $_) }	# If successful, do the rest
+				}
+			}
+			push @dataLog, "END $index\n";
+			extractData($index);
+			printLine($index, $optOutType);
+		}
+		printLine('footer', $optOutType);
+		printTotals();
+
+		if(1) {
+			# Write out @dataLog for future reading or analysis
+			open my $fh, '>', $dataLogFile;
+			foreach (@dataLog) { print $fh "$_"; }
+			close $fh;
+		}
+
+	} else {
+
+		# Read from a previously acquired @dataLog
+		my @indexList = ();
+		open my $fh, $optQueryFile or die "Can't open $optQueryFile";
+		@dataLog = (<$fh>);
+		close $fh;
+		foreach (grep /^START/, @dataLog) {
+			$_ =~ m/^START\s+(\d+)\s+/;
+			push @indexList, $1;
+		}
+		$hasTemperature = scalar grep /^SENSOR/, @dataLog;
+		printLine('header', $optOutType);
+		foreach $index (@indexList) {
+			extractData($index);
+			printLine($index, $optOutType);
+		}
+		printLine('footer', $optOutType);
+		printTotals();
+	}
+
+
+

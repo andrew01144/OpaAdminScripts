@@ -1,0 +1,41 @@
+#!/usr/bin/perl
+
+
+
+# Purpose: Update the names of switches in opaextractsellinks, as if the NodeDescs had been set.
+# Usage: opaextractsellinks | topoApplyGuids2Desc switchGUIDsFile
+
+use strict;
+use warnings;
+
+
+
+# Read the switchGUIDsFile
+my %ibnodes;
+{
+	my $fname = $ARGV[0];
+	open(IF, $fname) || die;
+	while(<IF>) {
+		chomp;
+		if(/^(0x0[0-9a-z]*),(\S+)/) {
+			$ibnodes{$1} = $2;
+		}
+	}
+}
+	
+
+while(<STDIN>) {
+	chomp;
+	my @l = split ';', $_;
+	foreach my $end (0, 4) {
+		if(exists($ibnodes{$l[0+$end]})) {
+			$l[3+$end] = $ibnodes{$l[0+$end]};
+		}
+	}
+	my $o = '';
+	foreach my $f (0..7) {
+		$o .= $l[$f]. ';';
+	}
+	$o =~ s/;$//;
+	print $o. "\n";
+}

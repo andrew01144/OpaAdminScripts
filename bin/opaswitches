@@ -1,0 +1,39 @@
+#!/bin/sh
+
+# List switches, managed or ext-managed
+#  opaextractswitches <all|int|ext> [opareport args]
+
+
+
+# To do: check validity of $1
+# needs -d 4 to get Node.PortInfo.Capability
+
+opt=$1
+shift
+
+opareport -qQ -o comps -x -F nodetype:SW:port:0 -d 4 "$@" | \
+  opaxmlextract -H -d \; -e Node.Capability -e Node.PortInfo.Capability -e Node.SystemImageGUID -e Node.NodeGUID -e Node.IPAddrIPV4 -e Node.NodeDesc | \
+  case "$opt" in
+    all)
+      cut -d \; -f 4,6
+      ;;
+    int)
+      sort -u -t \; -k 3,3 | grep -v ';VDR;' | cut -d \; -f 5,6 | sed 's/[ _][SL][0-9AB]*;/;/'
+      ;;
+    ext)
+      sort -u -t \; -k 3,3 | grep    ';VDR;' | cut -d \; -f 4,6
+      ;;
+    *)
+      cat > /dev/null
+      echo "arg1 is invalid"
+      ;;
+esac
+
+# What it does:
+#   get port 0 info from every switch node
+#   extract the data we want from the node record
+#   sort unique by the SystemImageGUID, that collapses all the director modules into one record
+#   grep PortInfo.Capability eq VDR; VDR == ext managed switch
+#   cut required fields
+#   sed the leaf/spine name out of the director name
+

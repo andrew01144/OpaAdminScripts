@@ -1,0 +1,131 @@
+#!/usr/bin/perl
+
+# Usage: opaBounce <NodeDesc.PortNum|NodeGUID.PortNum>
+# eg:
+#	opaBounce edge01.5
+#	opaBounce 0x001175010262ed00.8
+
+
+my $comment = qq|
+	take list of ports from command line
+	take list of ports from stdin or file
+	option to take other actions: [bounce], enable, disable, ledon, ledoff
+	help
+
+	option to confirm: resolves and checks each port, displays them, then asks for confirmation.
+	Can you bounce an FI from the fabric? Or do you get disconnected?
+
+	FYI - FIs may take a noticable time to respond to the opaportinfo.
+		Node with load average 0: instant.
+		Node with load average 16: ~300ms.
+
+Errors to detect
+	NodeDesc not found, NodeGUID not found: Done.
+	opaportinfo fails
+
+Tests:
+./opaBounce leaf06.33	# Good
+./opaBounce leaf06.56	# Bad PortNum
+./opaBounce leaf0a.56	# Bad NodeDesc
+./opaBounce core08.32	# Offline
+./opaBounce 'node195 hfi1_0.01'	# HFI
+
+
+
+Examples from script as of 2016-03-04:
+opaBounce core06.21
+opaportconfig -l 0x0033 -m 21 bounce     # core06.21 LinkUp
+opaBounce leaf06.7
+opaportconfig -l 0x0034 -m 7 bounce     # leaf06.7 Polling
+opaBounce core08.30
+opaportconfig -l 0x0012 -m 30 bounce     # core08.30 Offline: Cannot bounce an Offline port.
+
+
+|;
+
+
+use strict;
+
+my $opaArgs = ''; # like -h -p, $PORTS, etc
+
+
+#############################
+#############################
+#
+#  Step 1: Get LID from NodeGUID or NodeDesc.
+#
+
+my %desc2lid;
+my %guid2lid;
+my %lid2type;
+
+open my $ff, "opaextractlids -Qq $opaArgs |" || die;
+while (<$ff>) {
+	# 0x001175010262ed00;0;SW;core11;0x0003
+	chomp;
+	my @a = split ';', $_;
+	$guid2lid{$a[0]} = $a[4];
+	$desc2lid{$a[3]} = $a[4];
+	$lid2type{$a[4]} = $a[2];
+}
+close $ff;
+
+my $lid;
+my $port;
+
+	my $target = $ARGV[0];
+        if($target =~ /^(0x\w+)[\.:;](\d+)/) {
+		$lid = $guid2lid{$1};
+		$port = $2;
+		die "Could not map NodeGUID $1 to LID.\n" if !$lid;
+        } elsif($target =~ /^([\w -]+)[\.:;](\d+)/) {	# Allow spaces in NodeDesc
+		$lid = $desc2lid{$1};
+		$port = $2;
+		die "Could not map NodeDesc $1 to LID.\n" if !$lid;
+        } else {
+                die "Target not found on command line.\n";
+		exit;
+	}
+
+#############################
+#############################
+#
+#  Step 2: Get the current portstate, before we try to change it.
+#
+
+my %portState = ();
+open $ff, "opaportinfo $opaArgs -l $lid -m $port |" || die;
+while (<$ff>) {
+	#    LocalPort:     33                PortState:        Active
+	#    PhysicalState: LinkUp
+	#    LinkWidthDnGrd ActTx: 4  Rx: 4   En: 3,4           Sup: 1,2,3,4
+	#    LinkSpeed      Act: 25Gb         En: 25Gb          Sup: 25Gb
+	     if(/PortState:\s+(\w+)/) {
+		$portState{'PortState'} = $1;
+	} elsif(/PhysicalState:\s+(\w+)/) {
+		$portState{'PhysicalState'} = $1;
+	} elsif(/LinkWidthDnGrd\s+ActTx:\s+(\d)\s+Rx:\s+(\d)/) {
+		$portState{'ActTx'} = $1;
+		$portState{'ActRx'} = $2;
+	} elsif(/LinkSpeed\s+Act:\s+(\d+Gb)/) {
+		$portState{'LinkSpeed'} = $1;
+	}
+}
+close $ff;
+
+#############################
+#############################
+#
+#  Step 3: Print current state, the portconfig line, plus any warnings.
+#
+
+my $currentState = "$target current state: $portState{'PhysicalState'}/$portState{'PortState'}";
+$currentState  .=  ", $portState{'LinkSpeed'}/$portState{'ActTx'}X/$portState{'ActRx'}X" if $portState{'PhysicalState'} eq 'LinkUp';
+my $warning = '';
+$warning = "    # Warning: Cannot bounce an Offline port" if $portState{'PhysicalState'} eq 'Offline';
+$warning = "    # Warning: Port is an FI, Bounce may not work" if $lid2type{$lid} eq 'FI';
+
+print "opaportconfig -l $lid -m $port bounce     # $currentState\n";
+print "$warning\n" if $warning;
+
+

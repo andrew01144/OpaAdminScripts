@@ -1,0 +1,123 @@
+#!/usr/bin/perl
+
+# To do
+# option to pass in opareport args
+
+use strict;
+use Getopt::Long;
+
+sub usage {
+	my $usageText = qq@Usage: opaextractcablelinks [--all] [--singles] [--state] [--cables]
+            [--opaReportOptions="<opareport options>"]
+
+    opaextractcablelinks lists the CableInfo for every port in the fabric.
+    By pairing up the ends of each cable, it identifies links even when they are not active.
+    By default, it lists only links that are not active, and prints them in the same format
+    as opaextractsellinks.
+
+  Options:
+    --all     list all links, both active and not active.
+    --singles list cables with only one end.
+    --state   append port state to each line.
+    --cables  append CableInfo to each line.
+    --opaReportOptions  Pass these options to opareport. For -F, must use --all.
+
+  Example: List every cable
+    opaextractcablelinks -all -cable -singles
+
+  Example: List GUID and PortNum for all links in PortState:Init
+    opaextractcablelinks -state | grep Init | cut -d \\; -f 1,2
+
+  Example: List each type of cables and their quantities
+    opaextractcablelinks -all -cable -singles | cut -d \\; -f 9,10,11 | sort | uniq -c
+
+  Examples: Read from a snapshot file
+    opaextractcablelinks -opaReportOptions="-X snapshot.xml"
+@;
+	warn $usageText;
+	exit 1;
+}
+
+my $optCableInfo;
+my $optPortState;
+my $optAll;
+my $optSingles;
+my $optOpaReport;
+my $optHelp;
+GetOptions(
+	'all' => \$optAll,
+	'cables' => \$optCableInfo,
+	'state' => \$optPortState,
+	'singles' => \$optSingles,
+	'opaReportOptions=s' => \$optOpaReport,
+	'help' => \$optHelp,
+) or usage();
+usage() if $optHelp;
+
+my $args = '';
+$args .= ' -F portstate:notactive ' unless $optAll;
+# $args .= join ' ', @ARGV;
+$args .= $optOpaReport if $optOpaReport;
+
+my $cmd = "opareport -o comps -d 5 -A -x $args |".
+	"opaxmlextract -H -d ';' -s Focus -e NodeGUID -e PortNum -e NodeType -e NodeDesc ".
+		" -e PortState -e PhysState -e LinkSpeedActive -e LinkWidthDnGradeTxActive -e LinkWidthDnGradeRxActive".
+		" -e PortInfo.CableInfo.Length -e PortInfo.CableInfo.VendorName -e PortInfo.CableInfo.VendorPN -e PortInfo.CableInfo.VendorSN ".
+		" -s Neighbor -s SMs |";
+
+my %ports;
+my %cables;
+
+open my $ff, $cmd || die;
+foreach my $line (<$ff>) {
+	chomp $line;
+	my @a = split ';', $line;
+	my $port = "$a[0];$a[1]";
+	$ports{$port}{NodeType} = $a[2];
+	$ports{$port}{NodeDesc} = $a[3];
+	$ports{$port}{PortState} = join ';', @a[4,5,6,7,8];
+	my $cableID = "$a[10]$a[12]";
+	$ports{$port}{CableID}  = $cableID;
+	if($cableID) {
+		$cables{$cableID}{Ends}++;
+		$cables{$cableID}{Ports}[$cables{$cableID}{Ends}] = $port;
+		$cables{$cableID}{CableInfo} = join ';', @a[9, 10, 11, 12];
+	}
+}
+close $ff;
+
+
+my $nSingleEnds = 0;
+my $nActiveLinks = 0;
+my $nNotActiveLinks = 0;
+foreach my $cableID (keys %cables) {
+	if($cables{$cableID}{Ends} == 2) {
+		my $p1 = $cables{$cableID}{Ports}[1];
+		my $p2 = $cables{$cableID}{Ports}[2];
+		my $o = "$p1;$ports{$p1}{NodeType};$ports{$p1}{NodeDesc}".
+		       ";$p2;$ports{$p2}{NodeType};$ports{$p2}{NodeDesc}";
+		$o .= ";$cables{$cableID}{CableInfo}" if $optCableInfo;
+		$o .= ";$ports{$p1}{PortState};$ports{$p2}{PortState}" if $optPortState;
+		print "$o\n";
+		if($ports{$p1}{PortState} =~ /Active/) {
+			$nActiveLinks++;
+		} else {
+			$nNotActiveLinks++;
+		}
+	} elsif($cables{$cableID}{Ends} == 1) {
+	    if($optSingles) {
+		my $p1 = $cables{$cableID}{Ports}[1];
+		my $o = "$p1;$ports{$p1}{NodeType};$ports{$p1}{NodeDesc}".
+			";;;;";
+		$o .= ";$cables{$cableID}{CableInfo}" if $optCableInfo;
+		$o .= ";$ports{$p1}{PortState};;;;;" if $optPortState;
+		print "$o\n";
+	    }
+	    $nSingleEnds++;
+	} else {
+		warn "Internal error: Cable $cables{$cableID}{CableInfo} has $cables{$cableID}{Ends} ends\n";
+	}
+}
+$nActiveLinks = $optAll ? $nActiveLinks : 'NotCounted';
+warn "Summary: ActiveLinks: $nActiveLinks, NonActiveLinks: $nNotActiveLinks, Cables with only one end: $nSingleEnds\n";
+

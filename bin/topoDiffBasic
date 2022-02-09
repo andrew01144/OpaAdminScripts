@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# usage: opaextractsellinks > fabricfile; topoDiffBasic <topofile> <fabricfile>"
+
+# Purpose: Check fabric topology by comparing a cable map against the fabric.
+# Please use the more functional topoDiff.
+# This version (topoDiffBasic) is intended only to demonstrate the principle of using sdiff.
+
+topofile=$1	# Reference file, cable map, etc
+fabricfile=$2	# links from fabric, eg opaextractsellinks
+tmp=/tmp/topo
+
+
+# How this works
+# 1. Puts PortNum in %02d format to enable (eg) 2 to match with 02, and provide better sorting.
+# 2. Orients the links in a consistent way to enable (eg) Core01;05;Edge01;06 to match with Edge01;06:Core01;05.
+# 3. sort: sdiff requires input files to be sorted
+# 4. sdiff: to produce the report
+
+# eg: IBcore-m1 L101;01;IBedge_L1-C001;15
+perl -F\; -lane '
+    $a = sprintf("%s;%02d", $F[0], $F[1]);
+    $b = sprintf("%s;%02d", $F[2], $F[3]);
+    $c = ($a cmp $b) > 0 ? "$a;$b" : "$b;$a"; print $c;' $topofile   | sort > $tmp.topo
+
+# eg: 0x00066a00e30071b5;15;SW;IBedge_L1-C001;0x00066a00ec002966;1;SW;IBcore-m1 L101
+perl -F\; -lane '
+    $a = sprintf("%s;%02d", $F[3], $F[1]);
+    $b = sprintf("%s;%02d", $F[7], $F[5]);
+    $c = ($a cmp $b) > 0 ? "$a;$b" : "$b;$a"; print $c;' $fabricfile | sort > $tmp.fab
+
+sdiff -s $tmp.topo $tmp.fab
+
+# rm -f $tmp.*
+

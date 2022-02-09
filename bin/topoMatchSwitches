@@ -1,0 +1,106 @@
+#!/usr/bin/perl
+
+use strict;
+
+# Purpose: try to match a topology file with a real fabric to determine the names
+# of edge switches, using the portnumbers on the director leafs
+
+# You must have the director switched named to match the topo file, and be sure
+# that the cabling to the director switches is reasonable to plan.
+
+# Example:
+# opaextractsellinks | orientLinks | topoMatchSwitches topoISLs.txt | sort -t , -k 2
+
+
+# Alternate description
+# topoMatchSwitches attempts to create a GUID,switchName map; typically for one tier of externally managed switches.
+# Input: links from cable map, covering two tiers. eg: 
+#	IBcore-w1 L101;10;IBedge_w05;26
+#	IBcore-w1 L101;11;IBedge_w06;8
+# Input: links from real fabric, covering two tiers. eg:
+#	0x00066a00ec003a36;3;SW;IBcore-w1 L109;0x00066a00e3005951;8;SW;QLogic 12200 GUID=0x00066a00e3005951
+#	0x00066a00ec003a2a;3;SW;IBcore-w2 L109;0x00066a00e3005951;9;SW;QLogic 12200 GUID=0x00066a00e3005951
+# Link Orientation:
+#	The fabric links (from opaextractsellinks) must show the 'known' switch first.
+#	In the case of finding edge switches connected to a known director, that is director/leaf first.
+#	So, you will need to use 'orientLinks' to put them in the correct order.
+#	topoISLs.txt can be in any orientation.
+#
+#
+
+
+
+=cut
+
+fablinks:  $leafGUID, $leafPort, $leafType, $leafName, $edgeGUID, $edgePort, $edgeType, $edgeName
+            ignored    match2     ignored    match1     key        ignored    ignored    info
+
+topofile:  $leafName, $leafPort, $edgeName, $edgePort
+	   links are stored (and so matched) either way around.
+            match1     match2     result     ignored
+            result     ignored    match1     match2
+						
+=cut
+
+my %topoLinks;
+my %edgeNames;
+my %edgeCurrentName;
+
+# Read in the topo file
+open FF, $ARGV[0] || die;
+while (<FF>) {
+	tr /\r//d;
+	chomp;
+	my ($d1, $n1, $d2, $n2) = split ';', $_;
+	$n1 = int($n1);
+	$n2 = int($n2);
+	$topoLinks{"$d1;$n1"} = $d2;
+	$topoLinks{"$d2;$n2"} = $d1;
+}
+close FF;
+
+# Read in the fabric links, and match to topo file
+while (<STDIN>) {
+	tr /\r//d;
+	chomp;
+	# 0x00066a00ec003b3c;9;SW;IBcore-w2 L103;0x00066a00e3005c99;36;SW;RubbishRhubarb
+	my ($leafGUID, $leafPort, $leafType, $leafName, $edgeGUID, $edgePort, $edgeType, $edgeName) = split ';', $_;
+	$leafPort = int($leafPort);
+	if( exists($topoLinks{"$leafName;$leafPort"} )) {
+		$edgeNames{$edgeGUID} .= $topoLinks{"$leafName;$leafPort"}. ';';
+	} else {
+		# $edgeNames{$edgeGUID} .= 'NoMatch'. ';';
+		;
+	}
+	$edgeCurrentName{$edgeGUID} = $edgeName;
+}
+
+# choose the name most frequently matched
+foreach my $edgeGUID (keys %edgeNames) {
+	my @names = split ';', $edgeNames{$edgeGUID};
+	my %histogram = ();
+	# make a histogram
+	foreach (@names) {
+		$histogram{$_}++;
+	}
+	# sort the histogram
+	my @histoList = ();
+	foreach (keys %histogram) {
+		push @histoList, sprintf("%02d;%s", $histogram{$_}, $_);
+	}
+	@histoList = reverse sort @histoList;
+	# print this:
+	# 0x00066a00e3005c99,IBedge_w23	# matches: IBedge_w23 8/10, IBedge_w24 2/10, current name: i12k-00066a00e3005c99
+	my $name = $histoList[0];
+	$name =~ s/.*;//;
+	my $o = "$edgeGUID,$name";
+	$o .= "\t# matches: ";
+	my $n2 = split ';', $edgeNames{$edgeGUID};
+	foreach (@histoList) {
+		my ($n1, $name) = split ';', $_;
+		$n1 = sprintf("%2d", $n1);
+		$o .= "$name $n1/$n2, ";
+	}
+	$o .= "current name: $edgeCurrentName{$edgeGUID}";
+	print $o. "\n";
+}

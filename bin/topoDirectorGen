@@ -1,0 +1,43 @@
+#!/bin/bash
+
+name=phs1swivd10u07
+
+cat linksum_swd24.csv | sed "s/ZzNAMEqQ/$name/g" | \
+	perl -F\; -lane 'print "$F[8];$F[6];$F[11];$F[9]"' | \
+	grep -E ' S2(01|02|03|04|05|06|07|08|09|10|11|12)[AB]' | \
+	grep -E ' L1(01|02|03|04|05|06|07|08|09|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24)[AB]'
+	# grep -E ' S2(02|04|06|07|09|11|12)[AB]' | \
+	# grep -E ' L1(01|02|03|04|07|08|11|12|15|16|17|18|19|20|21|23|24)[AB]'
+
+exit
+
+# Don't change anything below here. Copy the lines you need to above the 'exit' and customize.
+
+# OPA 24-slot
+cat /opt/opa/samples/linksum_swd24.csv | sed "s/ZzNAMEqQ/$name/g" | \
+	perl -F\; -lane 'print "$F[8];$F[6];$F[11];$F[9]"' | \
+	grep -E ' S2(01|02|03|04|05|06|07|08|09|10|11|12)[AB]' | \
+	grep -E ' L1(01|02|03|04|05|06|07|08|09|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24)[AB]'
+
+# OPA 6-slot
+cat /opt/opa/samples/linksum_swd06.csv | sed "s/ZzNAMEqQ/$name/g" | \
+	perl -F\; -lane 'print "$F[8];$F[6];$F[11];$F[9]"' | \
+	grep -E ' S20[12][AB]'  | \
+	grep -E ' L1(01|02|03|04|05|06)[AB]'
+
+## True Scale
+
+# TS 36-slot
+cat /opt/iba/samples/linksum_360.csv | sed 's/ZzNAMEqQ/$name/g' | \
+	perl -F\; -lane 'print "$F[8];$F[6];$F[11];$F[9]"' | \
+	grep -E ' S(111|113|115|117|209|211|213|215|217)[AB]' | \
+	grep -E ' L(1(01|02|03|04|05|06|07|08|09|10|19|20|21|22|23|24|25|26|27|28)|2(01|02|03|04|05|06|07|08|19|20|21|22|23|24|25|26))'
+
+# TS 18-slot
+cat /opt/iba/samples/linksum_180.csv | sed 's/ZzNAMEqQ/$name/g' | \
+	perl -F\; -lane 'print "$F[8];$F[6];$F[11];$F[9]"' | \
+	grep -E ' S20[123456789][AB]' | \
+	grep -E ' L1(01|02|03|04|05|06|07|08|09|10|11|12|13|14|15|16|17|18)'
+	
+# linksums for -120 and -060 not provided.
+
