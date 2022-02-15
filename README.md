@@ -1,5 +1,7 @@
 # OpaAdminScripts
 Some scripts to help with managing an Omni-Path fabric.
+
+These are available with absolutely no support, and are in various states of completeness and functionality.
 ## Exploring the fabric
 ```
 opaswitches <all|int|ext>
@@ -49,7 +51,7 @@ topoDiff [-ci1h] <topofile> <fabricfile>
   Use instead opareport -o verifylinks -T topofile.xml. More convenient report format.
   
 topoMatchSwitches
-  Dtermine the name (NodeDesc) of each edge switch by matching to the topology file.
+  Determine the name (NodeDesc) of each edge switch by matching to the topology file.
   For 3-tier Direct/Edge fabrics only.
   Use instead of opagenswitches. More convenient, does not depend on correctly named compute nodes.
   
@@ -59,9 +61,6 @@ topoApplyGuids2Desc
   
 topoUnApplyGuids2Desc
   Reverses topoApplyGuids2Desc. Useful for testing.
-  
-topo_txt2xml
-  Converts a simple SwitchName1;Port1;Switchname2:Port2 text file to xml for use in opareport -T topofile.xml -o verifylinks.
 ```
 
 ## Other stuff
@@ -75,7 +74,9 @@ opaSwitchQueryFanSpeeds   - get fan speeds from ext-managed switches
 opaerrs_April2016         - earlier version of opaerrs
 topoDiffBasic             - demo of a simple script
 topoDirectorCheckSimple   - demo of a simple script
-
+  
+topo_txt2xml              - Converts a simple Name1;Port1;Name2:Port2 text file to xml for use in opareport -o verifylinks.
+  
 export PATH=/install/AndrewRussell/OpaAdminScripts/bin:$PATH
 ```
 
