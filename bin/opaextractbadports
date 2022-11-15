@@ -1,0 +1,12 @@
+#!/bin/bash
+
+# List all the ports in the fabric that appear to be a bad state.
+# That is, any port that is down without a good excuse.
+# e.g. It will find ports with cables but no link, ports in in Training.
+
+opareport -o comps -d 4 -A -F portstate:notactive -x $@ | \
+opaxmlextract -d \; -s Focus -e NodeGUID -e PortNum -e NodeDesc \
+-e PortState -e PhysState -e OfflineDisabledReason \
+-e OM4Length -e VendorName \
+-s Neighbor -s SMs | \
+grep -Ev ';Offline;(No Loc Media|Not installed|Disconnected);'
