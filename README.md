@@ -17,6 +17,10 @@ opaswitchquery [-N guid1,guid2] [-L nodefile] [hwCheck|config|vpd]
 
 opaextractswitchports
   List all switch ports, both online and offline.
+
+opaextractbadports
+  List all the ports in the fabric that appear to be a bad state.
+  It will find ports with cables but no link, ports in in Training, etc.
   
 opalinks
   Like opaextractsellinks, but generates two lines for each link, one in each orientation.
