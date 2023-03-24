@@ -56,7 +56,7 @@ topoDiff [-ci1h] <topofile> <fabricfile>
   
 topoMatchSwitches
   Determine the name (NodeDesc) of each edge switch by matching to the topology file.
-  For 3-tier Direct/Edge fabrics only.
+  For 3-tier Director/Edge fabrics only.
   Use instead of opagenswitches. More convenient, does not depend on correctly named compute nodes.
   
 topoApplyGuids2Desc
