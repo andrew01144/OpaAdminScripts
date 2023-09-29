@@ -194,7 +194,7 @@ if(!$optQueryFile) {
 		# 0x001175010262ed00,OmniPth00117501ff62ed00
 		# 0x001175010262ed00:0:0,OmniPth00117501ff62ed00,2
 		s/#.*//;
-		     if(/\b(0x[0-9A-Fa-f]+)\b.*?,(\w+)/) {
+		     if(/\b(0x[0-9A-Fa-f]+)\b.*?,([\w-]+)/) {
 			push @guidList, $1;
 			$nodeDescFromFile{$1} = $2;
 		} elsif(/\b(0x[0-9A-Fa-f]+)\b/) {
